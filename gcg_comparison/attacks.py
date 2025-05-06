@@ -136,6 +136,7 @@ def run_attack(gpu_id, job_queue, result_queue, args):
                     early_stop=args.early_stop,
                     num_steps=args.num_steps,
                     wandb_config=wandb_config,
+                    seed=42,
                 )
                 
                 # Run GCG
