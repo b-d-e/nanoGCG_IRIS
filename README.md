@@ -8,6 +8,9 @@ License](https://img.shields.io/pypi/l/transformer_lens?color=blue)
 
 nanoGCG is a lightweight but full-featured implementation of the GCG (Greedy Coordinate Gradient) algorithm. This implementation can be used to optimize adversarial strings on causal Hugging Face models.
 
+
+> Forked at `7d459` to add support for [IRIS](https://openreview.net/pdf?id=eIBWRAbhND) style attacks. Credit for original codebase belongs to the authors.
+
 ## Installation
 
 The nanoGCG package can be installed via pip:

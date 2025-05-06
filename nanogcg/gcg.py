@@ -3,6 +3,9 @@ import gc
 import logging
 import queue
 import threading
+import signal
+import sys
+import atexit
 
 from dataclasses import dataclass
 from tqdm import tqdm
@@ -13,6 +16,7 @@ import transformers
 from torch import Tensor
 from transformers import set_seed
 from scipy.stats import spearmanr
+import wandb
 
 from nanogcg.utils import (
     INIT_CHARS,
@@ -61,6 +65,7 @@ class GCGConfig:
     seed: int = None
     verbosity: str = "INFO"
     probe_sampling_config: Optional[ProbeSamplingConfig] = None
+    wandb_config: Optional[dict] = None
 
 
 @dataclass
@@ -225,6 +230,34 @@ class GCG:
             logger.warning("Tokenizer does not have a chat template. Assuming base model and setting chat template to empty.")
             tokenizer.chat_template = "{% for message in messages %}{{ message['content'] }}{% endfor %}"
 
+        if config.wandb_config:
+            
+            # if old notebook wandb run found, clear it
+            if wandb.run is not None:
+                wandb.finish()
+                logger.info("Cleared old wandb run.")
+
+            self.using_wandb = True
+
+            wandb.init(
+                project=config.wandb_config["project"],
+                entity=config.wandb_config["entity"],
+                config=config,
+            )
+            wandb.run.name = config.wandb_config["name"]
+
+            logger.info(f"Initialized wandb run: {wandb.run.name}")
+
+        else:
+            self.using_wandb = False
+            logger.info("Wandb not initialized.")
+
+    @atexit.register
+    def _cleanup(self):
+        if self.using_wandb:
+            wandb.finish()
+            logger.info("Wandb run finished.")
+    
     def run(
         self,
         messages: Union[str, List[dict]],
@@ -309,7 +342,7 @@ class GCG:
         losses = []
         optim_strings = []
 
-        for _ in tqdm(range(config.num_steps)):
+        for step in tqdm(range(config.num_steps)):
             # Compute the token gradient
             optim_ids_onehot_grad = self.compute_token_gradient(optim_ids)
 
@@ -329,6 +362,18 @@ class GCG:
                     sampled_ids = filter_ids(sampled_ids, tokenizer)
 
                 new_search_width = sampled_ids.shape[0]
+
+                # Log gradient statistics if using wandb
+                if self.using_wandb:
+                    wandb.log({
+                        "step": step,
+                        "search_width": new_search_width,
+                        # "gradient_mean": optim_ids_onehot_grad.mean().item(),
+                        # "gradient_std": optim_ids_onehot_grad.std().item(),
+                        # "gradient_max": optim_ids_onehot_grad.max().item(),
+                        "gradient_min": optim_ids_onehot_grad.min().item(),
+                        # "gradient_norm": optim_ids_onehot_grad.norm().item(),
+                    })
 
                 # Compute loss on all candidate sequences
                 batch_size = new_search_width if config.batch_size is None else config.batch_size
@@ -366,9 +411,46 @@ class GCG:
 
             buffer.log_buffer(tokenizer)
 
+            # Log current optimization state to wandb
+            if self.using_wandb:
+                # Get best loss from buffer
+                best_loss = buffer.get_lowest_loss()
+                
+                # Log metrics
+                wandb.log({
+                    "step": step,
+                    "current_loss": current_loss,
+                    "best_loss": best_loss,
+                    "loss_improvement": losses[0] - current_loss if len(losses) > 0 else 0,
+                    "loss_delta": losses[-2] - current_loss if len(losses) > 1 else 0,
+                })
+                
+                # Log text data
+                best_string_value = tokenizer.batch_decode(buffer.get_best_ids())[0]
+                wandb.log({
+                    "step": step,
+                    "text/current_string": wandb.Table(data=[[optim_str]], columns=["Content"]),
+                    "text/best_string": wandb.Table(data=[[best_string_value]], columns=["Content"]),
+                })
+                
+                # Update summary with latest best string
+                wandb.run.summary["best_string"] = best_string_value
+                wandb.run.summary["best_loss"] = best_loss
+                
+                # If using probe sampling, log correlation metrics
+                if self.config.probe_sampling_config is not None and hasattr(self, 'last_rank_correlation'):
+                    wandb.log({
+                        "step": step,
+                        "rank_correlation": self.last_rank_correlation,
+                        "alpha": (1 + self.last_rank_correlation) / 2,
+                    })
+
             if self.stop_flag:
                 logger.info("Early stopping due to finding a perfect match.")
+                if self.using_wandb:
+                    wandb.log({"early_stopped": True, "final_step": step})
                 break
+
 
         min_loss_index = losses.index(min(losses))
 
@@ -696,6 +778,20 @@ class GCG:
         # normalized from [-1, 1] to [0, 1]
         alpha = (1 + rank_correlation) / 2
 
+        self.last_rank_correlation = rank_correlation
+        
+        if self.using_wandb:
+            wandb.log({
+                "probe_sampling/rank_correlation": rank_correlation,
+                "probe_sampling/alpha": alpha,
+                "probe_sampling/probe_size": probe_size,
+                "probe_sampling/filtered_size": filtered_size,
+                "probe_sampling/best_probe_loss": probe_losses.min().item(),
+                "probe_sampling/mean_probe_loss": probe_losses.mean().item(),
+                "probe_sampling/mean_draft_loss": draft_losses.mean().item(),
+            })
+
+
         # Step 4. Calculate the filtered set and evaluate using the target model.
         R = probe_sampling_config.r
         filtered_size = int((1 - alpha) * B / R)
@@ -720,6 +816,7 @@ class GCG:
                 filtered_ids[filtered_losses.argmin()].unsqueeze(0),
             )
         )
+
 
 
 # A wrapper around the GCG `run` method that provides a simple API
