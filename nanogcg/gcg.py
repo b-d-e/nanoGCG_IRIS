@@ -419,9 +419,7 @@ class GCG:
                 # Log metrics
                 wandb.log({
                     "step": step,
-                    "current_loss": current_loss,
-                    "best_loss": best_loss,
-                    "loss_improvement": losses[0] - current_loss if len(losses) > 0 else 0,
+                    "loss": current_loss,
                     "loss_delta": losses[-2] - current_loss if len(losses) > 1 else 0,
                 })
                 
