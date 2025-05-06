@@ -428,7 +428,7 @@ class GCG:
                 wandb.log({
                     "step": step,
                     "text/current_string": wandb.Table(data=[[optim_str]], columns=["Content"]),
-                    "text/best_string": wandb.Table(data=[[best_string_value]], columns=["Content"]),
+                    # "text/best_string": wandb.Table(data=[[best_string_value]], columns=["Content"]),
                 })
                 
                 # Update summary with latest best string
