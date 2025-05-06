@@ -446,7 +446,8 @@ class GCG:
             if self.stop_flag:
                 logger.info("Early stopping due to finding a perfect match.")
                 if self.using_wandb:
-                    wandb.log({"early_stopped": True, "final_step": step})
+                    # wandb.log({"early_stopped": True, "final_step": step})
+                    wandb.run.summary["early_stopped"] = True
                 break
 
 
@@ -777,17 +778,6 @@ class GCG:
         alpha = (1 + rank_correlation) / 2
 
         self.last_rank_correlation = rank_correlation
-        
-        if self.using_wandb:
-            wandb.log({
-                "probe_sampling/rank_correlation": rank_correlation,
-                "probe_sampling/alpha": alpha,
-                "probe_sampling/probe_size": probe_size,
-                "probe_sampling/filtered_size": filtered_size,
-                "probe_sampling/best_probe_loss": probe_losses.min().item(),
-                "probe_sampling/mean_probe_loss": probe_losses.mean().item(),
-                "probe_sampling/mean_draft_loss": draft_losses.mean().item(),
-            })
 
 
         # Step 4. Calculate the filtered set and evaluate using the target model.
@@ -804,8 +794,22 @@ class GCG:
         best_probe_loss = probe_losses.min().item()
         best_filtered_loss = filtered_losses.min().item()
 
+
+        if self.using_wandb:
+            wandb.log({
+                "probe_sampling/rank_correlation": rank_correlation,
+                "probe_sampling/alpha": alpha,
+                "probe_sampling/probe_size": probe_size,
+                "probe_sampling/filtered_size": filtered_size,
+                "probe_sampling/best_probe_loss": best_probe_loss,
+                "probe_sampling/mean_probe_loss": probe_losses.mean().item(),
+                "probe_sampling/mean_draft_loss": draft_losses.mean().item(),
+                "probe_sampling/best_filtered_loss": best_filtered_loss,
+            })
+
         probe_ids = sampled_ids[probe_idxs]
         filtered_ids = sampled_ids[top_indices]
+        
         return (
             (best_probe_loss, probe_ids[probe_losses.argmin()].unsqueeze(0))
             if best_probe_loss < best_filtered_loss
