@@ -51,7 +51,7 @@ class GCGConfig:
     num_steps: int = 250
     optim_str_init: Union[str, List[str]] = "x x x x x x x x x x x x x x x x x x x x"
     search_width: int = 512
-    batch_size: int = None
+    batch_size: int  = None
     topk: int = 256
     n_replace: int = 1
     buffer_size: int = 0

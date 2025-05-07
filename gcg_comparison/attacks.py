@@ -62,7 +62,7 @@ def parse_args():
                         help="Number of GCG optimization steps.")
     parser.add_argument("--hf-cache-dir", type=str, default="/scratch/etheridge/huggingface/",
                         help="HuggingFace cache directory.")
-    
+
     return parser.parse_args()
 
 
@@ -225,9 +225,11 @@ def main():
         df = df.head(args.num_samples)
     
     # Add GCG target column - first two sentences of 'response'
-    df['gcg_target'] = df['response'].apply(
-        lambda x: x.split(". ")[0] + ". " + x.split(". ")[1] + "."
-    )
+    # df['gcg_target'] = df['response'].apply(
+    #     lambda x: x.split(". ")[0] + ". " + x.split(". ")[1] + "."
+    # )
+    # Add GCG target - "Sure, here is" to all rows
+    df['gcg_target'] = "Sure, here is"
     
     # Add result columns
     df['gcg_best_string'] = ""
