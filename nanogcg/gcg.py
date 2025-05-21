@@ -17,6 +17,7 @@ from torch import Tensor
 from transformers import set_seed
 from scipy.stats import spearmanr
 import wandb
+import numpy as np
 
 from nanogcg.utils import (
     INIT_CHARS,
@@ -71,7 +72,14 @@ class GCGConfig:
     target_string: Optional[str] = None
     target_no_think: Optional[bool] = None
 
-
+    # refusal direction minimisation terms
+    use_refusal_direction: bool = False
+    refusal_vector_path: Optional[str] = None
+    refusal_vector: Optional[torch.Tensor] = None
+    refusal_layer_idx: int = 31 
+    refusal_num_tokens: int = 3  
+    refusal_weight: float = 1.0  
+    combine_losses: bool = True  
 
 
 @dataclass
@@ -237,6 +245,43 @@ class GCG:
             logger.warning("Tokenizer does not have a chat template. Assuming base model and setting chat template to empty.")
             tokenizer.chat_template = "{% for message in messages %}{{ message['content'] }}{% endfor %}"
 
+
+        # Initialize refusal direction if enabled
+        if config.use_refusal_direction:
+            if config.refusal_vector is not None:
+                self.refusal_vector = config.refusal_vector.to(model.device, model.dtype)
+                logger.info(f"Using provided refusal vector with shape {self.refusal_vector.shape}")
+            elif config.refusal_vector_path:
+                try:
+                    # Try loading with torch
+                    self.refusal_vector = torch.load(config.refusal_vector_path, map_location=model.device)
+                    logger.info(f"Loaded refusal vector from {config.refusal_vector_path} using torch.load")
+                except:
+                    # Fall back to numpy
+                    try:
+                        refusal_array = np.load(config.refusal_vector_path)
+                        self.refusal_vector = torch.tensor(refusal_array, device=model.device)
+                        logger.info(f"Loaded refusal vector from {config.refusal_vector_path} using numpy")
+                    except Exception as e:
+                        logger.error(f"Failed to load refusal vector: {e}")
+                        raise
+                
+                # Convert to model's data type
+                self.refusal_vector = self.refusal_vector.to(dtype=model.dtype)
+                logger.info(f"Loaded refusal vector with shape {self.refusal_vector.shape} and dtype {self.refusal_vector.dtype}")
+                
+            else:
+                raise ValueError("When use_refusal_direction=True, must provide either refusal_vector or refusal_vector_path")
+            
+            # Normalize the refusal vector for stable dot product calculations
+            self.refusal_vector = self.refusal_vector / torch.norm(self.refusal_vector)
+            
+            # Register hooks for activation extraction
+            self.register_activation_hooks()
+            logger.info("Registered activation hooks for refusal direction")
+
+
+
         if config.wandb_config:
             
             # if old notebook wandb run found, clear it
@@ -258,6 +303,7 @@ class GCG:
         else:
             self.using_wandb = False
             logger.info("Wandb not initialized.")
+
 
         atexit.register(self._cleanup)
 
@@ -422,6 +468,22 @@ class GCG:
 
             # Log current optimization state to wandb
             if self.using_wandb:
+                if self.config.use_refusal_direction:
+                    # Calculate refusal term for the current best candidate
+                    if hasattr(self, 'activations') and 'target_layer' in self.activations:
+                        token_activations = self.activations['target_layer'][:, :self.config.refusal_num_tokens]
+                        mean_activations = torch.mean(token_activations, dim=1)
+                        norm_activations = mean_activations / (torch.norm(mean_activations, dim=1, keepdim=True) + 1e-6)
+                        refusal_alignments = torch.matmul(norm_activations, self.refusal_vector)
+                        
+                        wandb.log({
+                            "step": step,
+                            "refusal_alignment_mean": refusal_alignments.mean().item(),
+                            "refusal_alignment_std": refusal_alignments.std().item(),
+                            "refusal_alignemment_min": refusal_alignments.min().item(),
+                        })
+
+
                 # Get best loss from buffer
                 best_loss = buffer.get_lowest_loss()
                 
@@ -465,7 +527,7 @@ class GCG:
                     output = model.generate( 
                         input_tensor, 
                         do_sample=False, 
-                        max_new_tokens=2048
+                        max_new_tokens=2048,
                     )
                     response = tokenizer.batch_decode(
                         output[:, input_tensor.shape[1]:], 
@@ -523,6 +585,7 @@ class GCG:
             best_answer=response,
         )
 
+        wandb.finish()
 
         return result
 
@@ -582,16 +645,65 @@ class GCG:
 
         return buffer
 
-    def compute_token_gradient(
-        self,
-        optim_ids: Tensor,
-    ) -> Tensor:
-        """Computes the gradient of the GCG loss w.r.t the one-hot token matrix.
+    # def compute_token_gradient(
+    #     self,
+    #     optim_ids: Tensor,
+    # ) -> Tensor:
+    #     """Computes the gradient of the GCG loss w.r.t the one-hot token matrix.
 
-        Args:
-            optim_ids : Tensor, shape = (1, n_optim_ids)
-                the sequence of token ids that are being optimized
-        """
+    #     Args:
+    #         optim_ids : Tensor, shape = (1, n_optim_ids)
+    #             the sequence of token ids that are being optimized
+    #     """
+    #     model = self.model
+    #     embedding_layer = self.embedding_layer
+
+    #     # Create the one-hot encoding matrix of our optimized token ids
+    #     optim_ids_onehot = torch.nn.functional.one_hot(optim_ids, num_classes=embedding_layer.num_embeddings)
+    #     optim_ids_onehot = optim_ids_onehot.to(model.device, model.dtype)
+    #     optim_ids_onehot.requires_grad_()
+
+    #     # (1, num_optim_tokens, vocab_size) @ (vocab_size, embed_dim) -> (1, num_optim_tokens, embed_dim)
+    #     optim_embeds = optim_ids_onehot @ embedding_layer.weight
+
+    #     if self.prefix_cache:
+    #         input_embeds = torch.cat([optim_embeds, self.after_embeds, self.target_embeds], dim=1)
+    #         output = model(
+    #             inputs_embeds=input_embeds,
+    #             past_key_values=self.prefix_cache,
+    #             use_cache=True,
+    #         )
+    #     else:
+    #         input_embeds = torch.cat(
+    #             [
+    #                 self.before_embeds,
+    #                 optim_embeds,
+    #                 self.after_embeds,
+    #                 self.target_embeds,
+    #             ],
+    #             dim=1,
+    #         )
+    #         output = model(inputs_embeds=input_embeds)
+
+    #     logits = output.logits
+
+    #     # Shift logits so token n-1 predicts token n
+    #     shift = input_embeds.shape[1] - self.target_ids.shape[1]
+    #     shift_logits = logits[..., shift - 1 : -1, :].contiguous()  # (1, num_target_ids, vocab_size)
+    #     shift_labels = self.target_ids
+
+    #     if self.config.use_mellowmax:
+    #         label_logits = torch.gather(shift_logits, -1, shift_labels.unsqueeze(-1)).squeeze(-1)
+    #         loss = mellowmax(-label_logits, alpha=self.config.mellowmax_alpha, dim=-1)
+    #     else:
+    #         loss = torch.nn.functional.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+
+    #     optim_ids_onehot_grad = torch.autograd.grad(outputs=[loss], inputs=[optim_ids_onehot])[0]
+
+    #     return optim_ids_onehot_grad
+
+    def compute_token_gradient(self, optim_ids: Tensor) -> Tensor:
+        """Computes the gradient of the GCG loss w.r.t the one-hot token matrix."""
         model = self.model
         embedding_layer = self.embedding_layer
 
@@ -629,29 +741,71 @@ class GCG:
         shift_logits = logits[..., shift - 1 : -1, :].contiguous()  # (1, num_target_ids, vocab_size)
         shift_labels = self.target_ids
 
-        if self.config.use_mellowmax:
-            label_logits = torch.gather(shift_logits, -1, shift_labels.unsqueeze(-1)).squeeze(-1)
-            loss = mellowmax(-label_logits, alpha=self.config.mellowmax_alpha, dim=-1)
-        else:
-            loss = torch.nn.functional.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+        # Use the new loss function
+        loss = self.compute_loss_with_refusal_direction(shift_logits, shift_labels)
 
         optim_ids_onehot_grad = torch.autograd.grad(outputs=[loss], inputs=[optim_ids_onehot])[0]
 
         return optim_ids_onehot_grad
 
-    def _compute_candidates_loss_original(
-        self,
-        search_batch_size: int,
-        input_embeds: Tensor,
-    ) -> Tensor:
-        """Computes the GCG loss on all candidate token id sequences.
 
-        Args:
-            search_batch_size : int
-                the number of candidate sequences to evaluate in a given batch
-            input_embeds : Tensor, shape = (search_width, seq_len, embd_dim)
-                the embeddings of the `search_width` candidate sequences to evaluate
-        """
+    # def _compute_candidates_loss_original(
+    #     self,
+    #     search_batch_size: int,
+    #     input_embeds: Tensor,
+    # ) -> Tensor:
+    #     """Computes the GCG loss on all candidate token id sequences.
+
+    #     Args:
+    #         search_batch_size : int
+    #             the number of candidate sequences to evaluate in a given batch
+    #         input_embeds : Tensor, shape = (search_width, seq_len, embd_dim)
+    #             the embeddings of the `search_width` candidate sequences to evaluate
+    #     """
+    #     all_loss = []
+    #     prefix_cache_batch = []
+
+    #     for i in range(0, input_embeds.shape[0], search_batch_size):
+    #         with torch.no_grad():
+    #             input_embeds_batch = input_embeds[i:i + search_batch_size]
+    #             current_batch_size = input_embeds_batch.shape[0]
+
+    #             if self.prefix_cache:
+    #                 if not prefix_cache_batch or current_batch_size != search_batch_size:
+    #                     prefix_cache_batch = [[x.expand(current_batch_size, -1, -1, -1) for x in self.prefix_cache[i]] for i in range(len(self.prefix_cache))]
+
+    #                 outputs = self.model(inputs_embeds=input_embeds_batch, past_key_values=prefix_cache_batch, use_cache=True)
+    #             else:
+    #                 outputs = self.model(inputs_embeds=input_embeds_batch)
+
+    #             logits = outputs.logits
+
+    #             tmp = input_embeds.shape[1] - self.target_ids.shape[1]
+    #             shift_logits = logits[..., tmp-1:-1, :].contiguous()
+    #             shift_labels = self.target_ids.repeat(current_batch_size, 1)
+
+    #             if self.config.use_mellowmax:
+    #                 label_logits = torch.gather(shift_logits, -1, shift_labels.unsqueeze(-1)).squeeze(-1)
+    #                 loss = mellowmax(-label_logits, alpha=self.config.mellowmax_alpha, dim=-1)
+    #             else:
+    #                 loss = torch.nn.functional.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), reduction="none")
+
+    #             loss = loss.view(current_batch_size, -1).mean(dim=-1)
+    #             all_loss.append(loss)
+
+    #             if self.config.early_stop:
+    #                 if torch.any(torch.all(torch.argmax(shift_logits, dim=-1) == shift_labels, dim=-1)).item():
+    #                     self.stop_flag = True
+
+    #             del outputs
+    #             gc.collect()
+    #             torch.cuda.empty_cache()
+
+    #     return torch.cat(all_loss, dim=0)
+
+
+    def _compute_candidates_loss_original(self, search_batch_size: int, input_embeds: Tensor) -> Tensor:
+        """Computes the GCG loss on all candidate token id sequences."""
         all_loss = []
         prefix_cache_batch = []
 
@@ -674,14 +828,9 @@ class GCG:
                 shift_logits = logits[..., tmp-1:-1, :].contiguous()
                 shift_labels = self.target_ids.repeat(current_batch_size, 1)
 
-                if self.config.use_mellowmax:
-                    label_logits = torch.gather(shift_logits, -1, shift_labels.unsqueeze(-1)).squeeze(-1)
-                    loss = mellowmax(-label_logits, alpha=self.config.mellowmax_alpha, dim=-1)
-                else:
-                    loss = torch.nn.functional.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), reduction="none")
-
-                loss = loss.view(current_batch_size, -1).mean(dim=-1)
-                all_loss.append(loss)
+                # Use the new loss function
+                batch_loss = self.compute_loss_with_refusal_direction(shift_logits, shift_labels)
+                all_loss.append(batch_loss)
 
                 if self.config.early_stop:
                     if torch.any(torch.all(torch.argmax(shift_logits, dim=-1) == shift_labels, dim=-1)).item():
@@ -692,6 +841,7 @@ class GCG:
                 torch.cuda.empty_cache()
 
         return torch.cat(all_loss, dim=0)
+
 
     def _compute_candidates_loss_probe_sampling(
         self,
@@ -712,6 +862,9 @@ class GCG:
             A tuple of (min_loss: float, corresponding_sequence: Tensor)
 
         """
+
+        raise NotImplementedError("Probe sampling is not tested for refusal direction optimisation yet")
+
         probe_sampling_config = self.config.probe_sampling_config
         assert probe_sampling_config, "Probe sampling config wasn't set up properly."
 
@@ -883,6 +1036,84 @@ class GCG:
             )
         )
 
+
+    def register_activation_hooks(self):
+        """Register hooks to extract activations from specified layers."""
+        self.activations = {}
+        
+        def get_activation(name):
+            def hook(module, input, output):
+                # For DeepSeek models, input[0] contains the residual stream
+                self.activations[name] = input[0]
+            return hook
+        
+        # Register hook on the desired layer's input_layernorm
+        if self.config.use_refusal_direction:
+            if not hasattr(self.model, 'model') or not hasattr(self.model.model, 'layers'):
+                # Fallback for different model architectures
+                target_layers = list(self.model.modules())
+                # Find transformer layers (this might need adjustment based on model architecture)
+                transformer_layers = [m for m in target_layers if "TransformerBlock" in str(type(m)) or "DecoderLayer" in str(type(m))]
+                if self.config.refusal_layer_idx < len(transformer_layers):
+                    target_layer = transformer_layers[self.config.refusal_layer_idx]
+                    # Try to find input normalization layer
+                    for name, module in target_layer.named_modules():
+                        if "input_layernorm" in name or "input_norm" in name or "ln_1" in name:
+                            module.register_forward_hook(get_activation('target_layer'))
+                            break
+            else:
+                # For DeepSeek models
+                try:
+                    target_layer = self.model.model.layers[self.config.refusal_layer_idx].input_layernorm
+                    target_layer.register_forward_hook(get_activation('target_layer'))
+                except (IndexError, AttributeError) as e:
+                    logger.error(f"Failed to register hook: {e}")
+                    logger.error("Check if the model architecture is compatible and refusal_layer_idx is valid")
+                    raise
+
+
+    def compute_loss_with_refusal_direction(self, shift_logits, shift_labels):
+        """Compute loss with optional refusal direction component."""
+        
+        # Original loss calculation (cross-entropy or mellowmax)
+        if self.config.use_mellowmax:
+            label_logits = torch.gather(shift_logits, -1, shift_labels.unsqueeze(-1)).squeeze(-1)
+            original_loss = mellowmax(-label_logits, alpha=self.config.mellowmax_alpha, dim=-1)
+        else:
+            original_loss = torch.nn.functional.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                reduction="none"
+            ).view(shift_logits.shape[0], -1).mean(dim=-1)
+        
+        # Compute refusal direction term if enabled and activations are available
+        refusal_term = None
+        if self.config.use_refusal_direction and hasattr(self, 'activations') and 'target_layer' in self.activations:
+            # Extract activations for the specified number of tokens
+            token_activations = self.activations['target_layer'][:, :self.config.refusal_num_tokens]
+            
+            # Average across tokens for each example
+            mean_activations = torch.mean(token_activations, dim=1)
+            
+            # Normalize for cosine similarity-like behavior
+            norm_activations = mean_activations / (torch.norm(mean_activations, dim=1, keepdim=True) + 1e-6)
+            
+            # Compute dot product with refusal direction
+            refusal_term = torch.matmul(norm_activations, self.refusal_vector)
+            
+            # # For minimization, we want lower dot product values
+            # if self.using_wandb:
+            #     # Log the refusal term value
+            #     wandb.log({"refusal_term": refusal_term.item()})
+        
+        # Combine losses or return just the refusal term
+        if self.config.use_refusal_direction and refusal_term is not None:
+            if self.config.combine_losses:
+                return original_loss + self.config.refusal_weight * refusal_term
+            else:
+                return refusal_term
+        else:
+            return original_loss
 
 
 # A wrapper around the GCG `run` method that provides a simple API
