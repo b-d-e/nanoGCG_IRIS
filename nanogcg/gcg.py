@@ -66,6 +66,12 @@ class GCGConfig:
     verbosity: str = "INFO"
     probe_sampling_config: Optional[ProbeSamplingConfig] = None
     wandb_config: Optional[dict] = None
+    run_id: Optional[str] = None 
+    prompt_string: Optional[str] = None
+    target_string: Optional[str] = None
+    target_no_think: Optional[bool] = None
+
+
 
 
 @dataclass
@@ -74,6 +80,7 @@ class GCGResult:
     best_string: str
     losses: List[float]
     strings: List[str]
+    best_answer: Optional[str] = None
 
 
 class AttackBuffer:
@@ -252,7 +259,9 @@ class GCG:
             self.using_wandb = False
             logger.info("Wandb not initialized.")
 
-    @atexit.register
+        atexit.register(self._cleanup)
+
+
     def _cleanup(self):
         if self.using_wandb:
             wandb.finish()
@@ -425,16 +434,18 @@ class GCG:
                 
                 # Log text data
                 best_string_value = tokenizer.batch_decode(buffer.get_best_ids())[0]
-                wandb.log({
-                    "step": step,
-                    "text/current_string": wandb.Table(data=[[optim_str]], columns=["Content"]),
-                    # "text/best_string": wandb.Table(data=[[best_string_value]], columns=["Content"]),
-                })
+                # wandb.log({
+                #     "step": step,
+                #     "text/current_string": wandb.Table(data=[[optim_str]], columns=["Content"]),
+                #     # "text/best_string": wandb.Table(data=[[best_string_value]], columns=["Content"]),
+                # })
                 
                 # Update summary with latest best string
                 wandb.run.summary["best_string"] = best_string_value
                 wandb.run.summary["best_loss"] = best_loss
-                
+
+
+
                 # If using probe sampling, log correlation metrics
                 if self.config.probe_sampling_config is not None and hasattr(self, 'last_rank_correlation'):
                     wandb.log({
@@ -442,6 +453,25 @@ class GCG:
                         "rank_correlation": self.last_rank_correlation,
                         "alpha": (1 + self.last_rank_correlation) / 2,
                     })
+
+                if step % 25 == 0:
+                    full_prompt = self.config.prompt_string + " " + best_string_value
+                    messages = [{"role": "user", "content": full_prompt}]
+                    input_tensor = tokenizer.apply_chat_template(
+                        messages, 
+                        add_generation_prompt=True, 
+                        return_tensors="pt"
+                    ).to(model.device, torch.int64)
+                    output = model.generate( 
+                        input_tensor, 
+                        do_sample=False, 
+                        max_new_tokens=2048
+                    )
+                    response = tokenizer.batch_decode(
+                        output[:, input_tensor.shape[1]:], 
+                        skip_special_tokens=True
+                    )[0]
+                    wandb.run.summary["best_answer"] = response
 
             if self.stop_flag:
                 logger.info("Early stopping due to finding a perfect match.")
@@ -453,12 +483,46 @@ class GCG:
 
         min_loss_index = losses.index(min(losses))
 
+
+        # generate response and log to wanndb
+        # Generate with the model using the optimized prompt
+        # full_prompt = row['forbidden_prompt'] + " " + best_string
+        # full_prompt = before_str + optim_strings[min_loss_index] + after_str
+        best_string_value = tokenizer.batch_decode(buffer.get_best_ids())[0]
+        full_prompt = self.config.prompt_string + " " + best_string_value
+        print(full_prompt)
+
+        messages = [{"role": "user", "content": full_prompt}]
+        input_tensor = tokenizer.apply_chat_template(
+            messages, 
+            add_generation_prompt=True, 
+            return_tensors="pt"
+        ).to(model.device, torch.int64)
+        
+        output = model.generate(
+            input_tensor, 
+            do_sample=False, 
+            max_new_tokens=2048
+        )
+        
+        response = tokenizer.batch_decode(
+            output[:, input_tensor.shape[1]:], 
+            skip_special_tokens=True
+        )[0]
+        
+        if self.using_wandb:
+            wandb.run.summary["best_answer"] = response
+
+
+
         result = GCGResult(
             best_loss=losses[min_loss_index],
             best_string=optim_strings[min_loss_index],
             losses=losses,
             strings=optim_strings,
+            best_answer=response,
         )
+
 
         return result
 
