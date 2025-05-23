@@ -19,6 +19,8 @@ from scipy.stats import spearmanr
 import wandb
 import numpy as np
 
+from nanogcg.iris import IRISRefusalHandler
+
 from nanogcg.utils import (
     INIT_CHARS,
     configure_pad_token,
@@ -81,7 +83,13 @@ class GCGConfig:
     
     # New option to use the final prompt token
     use_final_prompt_token: bool = False  # If True, use final prompt token instead of first response tokens
-    
+
+    # IRIS style
+    use_iris_style: bool = False  # Use IRIS multi-layer approach
+    refusal_layers: Optional[List[int]] = None  # Which layers to use (default: all)
+    average_across_layers: bool = False  # Average instead of sum across layers
+    iris_normalisation_constant: float = 33 # because iris loss term is otherwise massively higher
+
     # New scheduling parameters
     use_refusal_beta_schedule: bool = False
     schedule_type: str = "linear"  # "linear" or "cosine"
@@ -257,6 +265,7 @@ class GCG:
             logger.warning("Tokenizer does not have a chat template. Assuming base model and setting chat template to empty.")
             tokenizer.chat_template = "{% for message in messages %}{{ message['content'] }}{% endfor %}"
 
+        self.init_iris_handler()
 
         # Initialize refusal direction if enabled
         if config.use_refusal_direction:
@@ -288,9 +297,9 @@ class GCG:
             # Normalize the refusal vector for stable dot product calculations
             self.refusal_vector = self.refusal_vector / torch.norm(self.refusal_vector)
             
-            # Register hooks for activation extraction
-            self.register_activation_hooks()
-            logger.info("Registered activation hooks for refusal direction")
+            # # Register hooks for activation extraction
+            # self.register_activation_hooks()
+            # logger.info("Registered activation hooks for refusal direction")
 
         if config.wandb_config:
             # if old notebook wandb run found, clear it
@@ -320,6 +329,14 @@ class GCG:
             wandb.finish()
             logger.info("Wandb run finished.")
     
+    def init_iris_handler(self):
+        """Initialize IRIS refusal handler - add this to __init__"""
+        if self.config.use_refusal_direction and self.config.use_iris_style:
+            self.iris_handler = IRISRefusalHandler(self.model, self.config)
+            logger.info("Initialized IRIS-style refusal handler")
+        else:
+            self.iris_handler = None
+        
     def add_wandb_metric(self, name: str, value: Any) -> None:
         """Add a metric to the wandb metrics dictionary."""
         if self.using_wandb:
@@ -921,43 +938,10 @@ class GCG:
             )
         )
 
-    def register_activation_hooks(self):
-        """Register hooks to extract activations from specified layers."""
-        self.activations = {}
-        
-        def get_activation(name):
-            def hook(module, input, output):
-                # For DeepSeek models, input[0] contains the residual stream
-                self.activations[name] = input[0]
-            return hook
-        
-        # Register hook on the desired layer's input_layernorm
-        if self.config.use_refusal_direction:
-            if not hasattr(self.model, 'model') or not hasattr(self.model.model, 'layers'):
-                # Fallback for different model architectures
-                target_layers = list(self.model.modules())
-                # Find transformer layers (this might need adjustment based on model architecture)
-                transformer_layers = [m for m in target_layers if "TransformerBlock" in str(type(m)) or "DecoderLayer" in str(type(m))]
-                if self.config.refusal_layer_idx < len(transformer_layers):
-                    target_layer = transformer_layers[self.config.refusal_layer_idx]
-                    # Try to find input normalization layer
-                    for name, module in target_layer.named_modules():
-                        if "input_layernorm" in name or "input_norm" in name or "ln_1" in name:
-                            module.register_forward_hook(get_activation('target_layer'))
-                            break
-            else:
-                # For DeepSeek models
-                try:
-                    target_layer = self.model.model.layers[self.config.refusal_layer_idx].input_layernorm
-                    target_layer.register_forward_hook(get_activation('target_layer'))
-                except (IndexError, AttributeError) as e:
-                    logger.error(f"Failed to register hook: {e}")
-                    logger.error("Check if the model architecture is compatible and refusal_layer_idx is valid")
-                    raise
-
-
     def compute_loss_with_refusal_direction(self, shift_logits, shift_labels):
-        """Compute loss with optional refusal direction component using scheduled beta."""
+        """
+        IRIS-style loss computation with multi-layer refusal direction.
+        """
         
         # Original loss calculation (cross-entropy or mellowmax)
         if self.config.use_mellowmax:
@@ -970,123 +954,55 @@ class GCG:
                 reduction="none"
             ).view(shift_logits.shape[0], -1).mean(dim=-1)
         
-        # Store original loss metrics for wandb
+        # Store original loss metrics
         if self.using_wandb:
             self.add_wandb_metric("token_force_loss_mean", original_loss.mean().item())
-            self.add_wandb_metric("token_force_loss_std", original_loss.std().item())
             self.add_wandb_metric("token_force_loss_min", original_loss.min().item())
-
-        # Get current refusal beta value based on schedule
+        
+        # Get current beta (with scheduling if enabled)
         current_beta = self.get_current_refusal_beta()
         
-        # If using wandb, log the current beta value
         if self.using_wandb:
             self.add_wandb_metric("refusal_beta", current_beta)
-
-        # Compute refusal direction term if enabled and activations are available
-        refusal_term = None
-        if self.config.use_refusal_direction and hasattr(self, 'activations') and 'target_layer' in self.activations:
-            activations = self.activations['target_layer']
-            seq_len = activations.shape[1]
-            
-            # Debug logging
-            if self.using_wandb:
-                self.add_wandb_metric("activation_seq_len", seq_len)
-            
-            if seq_len == 0:
-                logger.warning("No activations available (sequence length is 0)")
-                return original_loss
-            
-            if self.config.use_final_prompt_token:
-                # When using prefix caching, the activation sequence might not include
-                # the 'before' tokens, only: optim_tokens + after_tokens + target_tokens
-                # So we need to calculate the position differently
-                
-                target_length = self.target_ids.shape[1]
-                
-                # The prompt ends just before the target begins
-                # In the activation sequence (which might not include prefix cached tokens),
-                # this is at position (seq_len - target_length - 1)
-                prompt_end_position = seq_len - target_length - 1
-                
-                # Ensure the position is valid
-                if prompt_end_position < 0 or prompt_end_position >= seq_len:
-                    # If we can't find the right position, use the last token before target
-                    # or the first available token as fallback
-                    logger.warning(f"Calculated prompt end position {prompt_end_position} is out of bounds [0, {seq_len}). "
-                                f"Activation seq_len: {seq_len}, target_length: {target_length}")
-                    if seq_len > target_length:
-                        # Use the token just before where targets would start
-                        prompt_end_position = seq_len - target_length - 1
-                        prompt_end_position = max(0, prompt_end_position)
-                    else:
-                        # Sequence is too short, use first token
-                        prompt_end_position = 0
-                
-                # Extract the activation at the prompt end position
-                token_activations = activations[:, prompt_end_position:(prompt_end_position + 1), :]
-                
-                if self.using_wandb:
-                    self.add_wandb_metric("prompt_position_used", prompt_end_position)
-                    self.add_wandb_metric("target_length", target_length)
-                    self.add_wandb_metric("final_prompt_token_shape", list(token_activations.shape))
-            else:
-                # Original behavior: use first N tokens of the response
-                # But make sure we don't exceed the sequence length
-                num_tokens = min(self.config.refusal_num_tokens, seq_len)
-                token_activations = activations[:, :num_tokens, :]
-                
-                if self.using_wandb:
-                    self.add_wandb_metric("num_response_tokens_used", num_tokens)
-            
-            # Check if we have valid activations
-            if token_activations.shape[1] == 0:
-                logger.warning("No valid token activations extracted")
-                return original_loss
-            
-            # Average across tokens for each example
-            mean_activations = torch.mean(token_activations, dim=1)
-            
-            # Check for NaN in activations
-            if torch.isnan(mean_activations).any():
-                logger.warning("NaN detected in mean activations")
-                return original_loss
-            
-            refusal_term = mean_activations @ self.refusal_vector 
-            
-            # Take absolute value for minimization
-            refusal_term = torch.abs(refusal_term)
-            
-            # Check for NaN in refusal term
-            if torch.isnan(refusal_term).any():
-                logger.warning("NaN detected in refusal term")
-                return original_loss
-
-            # Add refusal term metrics for wandb
-            if self.using_wandb:
-                self.add_wandb_metric("refusal_term_mean", refusal_term.mean().item())
-                self.add_wandb_metric("refusal_term_min", refusal_term.min().item())
-                self.add_wandb_metric("refusal_term_max", refusal_term.max().item())
-                
-                # Log which tokens were used
-                if self.config.use_final_prompt_token:
-                    self.add_wandb_metric("refusal_token_type", "final_prompt_token")
-                else:
-                    self.add_wandb_metric("refusal_token_type", f"first_{num_tokens}_response_tokens")
         
-        # Combine losses or return just the original loss
-        if self.config.use_refusal_direction and refusal_term is not None:
-            combined_loss = (1 - current_beta) * original_loss + current_beta * refusal_term
-            
-            # Log combined loss metrics for wandb
-            if self.using_wandb:
-                self.add_wandb_metric("combined_loss_mean", combined_loss.mean().item())
-                self.add_wandb_metric("combined_loss_min", combined_loss.min().item())
-            
-            return combined_loss
-        else:
-            return original_loss
-
+        # Compute IRIS-style refusal term if enabled
+        if self.config.use_refusal_direction and self.config.use_iris_style and self.iris_handler:
+            # Determine last input token position
+            if hasattr(self.iris_handler, 'activations') and self.iris_handler.activations:
+                # Get any activation to check sequence length
+                sample_activation = next(iter(self.iris_handler.activations.values()))
+                seq_len = sample_activation.shape[1]
+                target_len = self.target_ids.shape[1]
+                
+                last_input_pos = self.iris_handler.get_last_input_token_position(seq_len, target_len)
+                
+                # Compute IRIS refusal loss
+                refusal_term = self.iris_handler.compute_iris_refusal_loss(last_input_pos)
+                
+                if refusal_term is not None:
+                    # Log metrics
+                    if self.using_wandb:
+                        self.add_wandb_metric("refusal_loss_mean", refusal_term.mean().item())
+                        self.add_wandb_metric("refusal_loss_max", refusal_term.max().item())
+                        self.add_wandb_metric("refusal_loss_min", refusal_term.min().item())
+                        self.add_wandb_metric("last_input_token_pos", last_input_pos)
+                        self.add_wandb_metric("num_refusal_layers", len(self.iris_handler.refusal_vectors))
+                    
+                    # Combine losses: L = (1-β) * original_loss + β * refusal_term
+                    combined_loss = (1 - current_beta) * original_loss + current_beta * refusal_term
+                    
+                    if self.using_wandb:
+                        self.add_wandb_metric("combined_loss_mean", combined_loss.mean().item())
+                        self.add_wandb_metric("combined_loss_min", combined_loss.min().item())
+                    
+                    return combined_loss
+        
+        # Fall back to original implementation if not using IRIS style
+        elif self.config.use_refusal_direction and not self.config.use_iris_style:
+            # Your existing single-layer implementation
+            return self.compute_loss_with_refusal_direction_original(shift_logits, shift_labels)
+        
+        return original_loss
 
     def get_current_refusal_beta(self):
         """Get the current refusal beta value based on the selected schedule."""
