@@ -46,7 +46,6 @@ class ProbeSamplingConfig:
     r: int = 8
     sampling_factor: int = 16
 
-
 @dataclass
 class GCGConfig:
     num_steps: int = 250
@@ -79,6 +78,9 @@ class GCGConfig:
     refusal_layer_idx: int = None 
     refusal_num_tokens: int = None
     refusal_beta: float = 0.75  # weight balancing term
+    
+    # New option to use the final prompt token
+    use_final_prompt_token: bool = False  # If True, use final prompt token instead of first response tokens
     
     # New scheduling parameters
     use_refusal_beta_schedule: bool = False
@@ -370,6 +372,14 @@ class GCG:
         after_ids = tokenizer([after_str], add_special_tokens=False, return_tensors="pt")["input_ids"].to(model.device, torch.int64)
         target_ids = tokenizer([target], add_special_tokens=False, return_tensors="pt")["input_ids"].to(model.device, torch.int64)
 
+        # Store the prompt length for refusal direction calculation
+        # The prompt consists of before_ids + optim_ids + after_ids
+        # We'll calculate the exact position during loss computation
+        if config.use_final_prompt_token:
+            # Store the length up to where the prompt ends (before target begins)
+            # This will be used to identify the final prompt token position
+            self.prompt_length = before_ids.shape[1] + len(tokenizer(config.optim_str_init, add_special_tokens=False)["input_ids"]) + after_ids.shape[1]
+        
         # Embed everything that doesn't get optimized
         embedding_layer = self.embedding_layer
         before_embeds, after_embeds, target_embeds = [embedding_layer(ids) for ids in (before_ids, after_ids, target_ids)]
@@ -976,26 +986,93 @@ class GCG:
         # Compute refusal direction term if enabled and activations are available
         refusal_term = None
         if self.config.use_refusal_direction and hasattr(self, 'activations') and 'target_layer' in self.activations:
-            # Extract activations for the specified number of tokens
-            token_activations = self.activations['target_layer'][:, :self.config.refusal_num_tokens]
+            activations = self.activations['target_layer']
+            seq_len = activations.shape[1]
+            
+            # Debug logging
+            if self.using_wandb:
+                self.add_wandb_metric("activation_seq_len", seq_len)
+            
+            if seq_len == 0:
+                logger.warning("No activations available (sequence length is 0)")
+                return original_loss
+            
+            if self.config.use_final_prompt_token:
+                # When using prefix caching, the activation sequence might not include
+                # the 'before' tokens, only: optim_tokens + after_tokens + target_tokens
+                # So we need to calculate the position differently
+                
+                target_length = self.target_ids.shape[1]
+                
+                # The prompt ends just before the target begins
+                # In the activation sequence (which might not include prefix cached tokens),
+                # this is at position (seq_len - target_length - 1)
+                prompt_end_position = seq_len - target_length - 1
+                
+                # Ensure the position is valid
+                if prompt_end_position < 0 or prompt_end_position >= seq_len:
+                    # If we can't find the right position, use the last token before target
+                    # or the first available token as fallback
+                    logger.warning(f"Calculated prompt end position {prompt_end_position} is out of bounds [0, {seq_len}). "
+                                f"Activation seq_len: {seq_len}, target_length: {target_length}")
+                    if seq_len > target_length:
+                        # Use the token just before where targets would start
+                        prompt_end_position = seq_len - target_length - 1
+                        prompt_end_position = max(0, prompt_end_position)
+                    else:
+                        # Sequence is too short, use first token
+                        prompt_end_position = 0
+                
+                # Extract the activation at the prompt end position
+                token_activations = activations[:, prompt_end_position:(prompt_end_position + 1), :]
+                
+                if self.using_wandb:
+                    self.add_wandb_metric("prompt_position_used", prompt_end_position)
+                    self.add_wandb_metric("target_length", target_length)
+                    self.add_wandb_metric("final_prompt_token_shape", list(token_activations.shape))
+            else:
+                # Original behavior: use first N tokens of the response
+                # But make sure we don't exceed the sequence length
+                num_tokens = min(self.config.refusal_num_tokens, seq_len)
+                token_activations = activations[:, :num_tokens, :]
+                
+                if self.using_wandb:
+                    self.add_wandb_metric("num_response_tokens_used", num_tokens)
+            
+            # Check if we have valid activations
+            if token_activations.shape[1] == 0:
+                logger.warning("No valid token activations extracted")
+                return original_loss
             
             # Average across tokens for each example
             mean_activations = torch.mean(token_activations, dim=1)
             
-            refusal_term = mean_activations @ self.refusal_vector 
-            # ^ matmul should implement dot product across the batch dimension
-
-
-            # Take absolute value for minimization
-            # refusal_term = 1 / torch.abs(refusal_term) 
+            # Check for NaN in activations
+            if torch.isnan(mean_activations).any():
+                logger.warning("NaN detected in mean activations")
+                return original_loss
             
+            refusal_term = mean_activations @ self.refusal_vector 
+            
+            # Take absolute value for minimization
             refusal_term = torch.abs(refusal_term)
+            
+            # Check for NaN in refusal term
+            if torch.isnan(refusal_term).any():
+                logger.warning("NaN detected in refusal term")
+                return original_loss
 
             # Add refusal term metrics for wandb
             if self.using_wandb:
                 self.add_wandb_metric("refusal_term_mean", refusal_term.mean().item())
                 self.add_wandb_metric("refusal_term_min", refusal_term.min().item())
                 self.add_wandb_metric("refusal_term_max", refusal_term.max().item())
+                
+                # Log which tokens were used
+                if self.config.use_final_prompt_token:
+                    self.add_wandb_metric("refusal_token_type", "final_prompt_token")
+                else:
+                    self.add_wandb_metric("refusal_token_type", f"first_{num_tokens}_response_tokens")
         
         # Combine losses or return just the original loss
         if self.config.use_refusal_direction and refusal_term is not None:
