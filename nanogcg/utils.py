@@ -4,6 +4,8 @@ import inspect
 import torch
 from torch import Tensor
 from transformers import PreTrainedTokenizerBase
+import math 
+
 
 INIT_CHARS = [
     ".", ",", "!", "?", ";", ":", "(", ")", "[", "]", "{", "}",
@@ -129,3 +131,60 @@ def configure_pad_token(tokenizer: PreTrainedTokenizerBase) -> PreTrainedTokeniz
     else:
         tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
     return tokenizer
+
+
+def linear_schedule(start_value, end_value, current_step, total_steps):
+    """Simple linear schedule from start_value to end_value over total_steps."""
+    if current_step >= total_steps:
+        return end_value
+    
+    progress = current_step / total_steps
+    return start_value + progress * (end_value - start_value)
+
+
+def cosine_schedule(start_value, end_value, current_step, total_steps):
+    """Cosine schedule from start_value to end_value over total_steps."""
+    if current_step >= total_steps:
+        return end_value
+    
+    progress = current_step / total_steps
+    cosine_factor = 0.5 * (1 + math.cos(math.pi * (1 - progress)))
+    return end_value + cosine_factor * (start_value - end_value)
+
+
+def exponential_schedule(start_value, end_value, current_step, total_steps, exponent=2.0):
+    """
+    Exponential schedule from start_value to end_value.
+    The exponent controls the shape of the curve - higher values make it more convex.
+    
+    With exponent=2.0, this creates a convex curve where the rate of increase 
+    accelerates as we progress through the steps.
+    """
+    if current_step >= total_steps:
+        return end_value
+    
+    # Calculate normalized progress (0 to 1)
+    progress = current_step / total_steps
+    
+    # Apply exponential function to progress
+    # This creates a convex curve when exponent > 1
+    exponential_progress = progress ** exponent
+    
+    # Interpolate between start and end values
+    return start_value + exponential_progress * (end_value - start_value)
+
+
+def power_schedule(start_value, end_value, current_step, total_steps, power=3.0):
+    """
+    Power schedule - another way to create a convex curve.
+    Similar to exponential but with different curve characteristics.
+    Higher power values create a more pronounced convex shape.
+    """
+    if current_step >= total_steps:
+        return end_value
+    
+    progress = current_step / total_steps
+    power_progress = pow(progress, power)
+    
+    return start_value + power_progress * (end_value - start_value)
+

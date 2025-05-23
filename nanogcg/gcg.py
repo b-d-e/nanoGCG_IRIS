@@ -9,8 +9,8 @@ import atexit
 
 from dataclasses import dataclass
 from tqdm import tqdm
-from typing import List, Optional, Tuple, Union
-
+from typing import List, Optional, Tuple, Union, Dict, Any
+from typing import Callable
 import torch
 import transformers
 from torch import Tensor
@@ -76,11 +76,19 @@ class GCGConfig:
     use_refusal_direction: bool = False
     refusal_vector_path: Optional[str] = None
     refusal_vector: Optional[torch.Tensor] = None
-    refusal_layer_idx: int = 31 
-    refusal_num_tokens: int = 3  
-    refusal_weight: float = 1.0  
-    combine_losses: bool = True  
-
+    refusal_layer_idx: int = None 
+    refusal_num_tokens: int = None
+    refusal_beta: float = 0.75  # weight balancing term
+    
+    # New scheduling parameters
+    use_refusal_beta_schedule: bool = False
+    schedule_type: str = "linear"  # "linear" or "cosine"
+    refusal_beta_start: float = 0.0
+    refusal_beta_end: float = 0.75
+    schedule_start_step: int = 0
+    schedule_end_step: Optional[int] = None  # If None, will use num_steps
+    schedule_exponent: float = 2.0  # For exponential schedule
+    schedule_power: float = 2.0     # For power schedule
 
 @dataclass
 class GCGResult:
@@ -224,6 +232,8 @@ class GCG:
         self.draft_prefix_cache = None
 
         self.stop_flag = False
+        self.step = 0  # Initialize step counter
+        self.wandb_metrics = {}  # Initialize metrics dictionary
 
         self.draft_model = None
         self.draft_tokenizer = None
@@ -280,10 +290,7 @@ class GCG:
             self.register_activation_hooks()
             logger.info("Registered activation hooks for refusal direction")
 
-
-
         if config.wandb_config:
-            
             # if old notebook wandb run found, clear it
             if wandb.run is not None:
                 wandb.finish()
@@ -304,14 +311,29 @@ class GCG:
             self.using_wandb = False
             logger.info("Wandb not initialized.")
 
-
         atexit.register(self._cleanup)
-
 
     def _cleanup(self):
         if self.using_wandb:
             wandb.finish()
             logger.info("Wandb run finished.")
+    
+    def add_wandb_metric(self, name: str, value: Any) -> None:
+        """Add a metric to the wandb metrics dictionary."""
+        if self.using_wandb:
+            self.wandb_metrics[name] = value
+    
+    def log_wandb_metrics(self) -> None:
+        """Log all collected metrics to wandb."""
+        if self.using_wandb and self.wandb_metrics:
+            # Add step to metrics
+            self.wandb_metrics['step'] = self.step
+            
+            # Log all metrics at once
+            wandb.log(self.wandb_metrics)
+            
+            # Clear metrics dictionary for next step
+            self.wandb_metrics = {}
     
     def run(
         self,
@@ -398,11 +420,12 @@ class GCG:
         optim_strings = []
 
         for step in tqdm(range(config.num_steps)):
+            self.step = step  # Update step counter
+            
             # Compute the token gradient
             optim_ids_onehot_grad = self.compute_token_gradient(optim_ids)
 
             with torch.no_grad():
-
                 # Sample candidate token sequences based on the token gradient
                 sampled_ids = sample_ids_from_grad(
                     optim_ids.squeeze(0),
@@ -418,17 +441,10 @@ class GCG:
 
                 new_search_width = sampled_ids.shape[0]
 
-                # Log gradient statistics if using wandb
+                # Store gradient statistics for wandb
                 if self.using_wandb:
-                    wandb.log({
-                        "step": step,
-                        "search_width": new_search_width,
-                        # "gradient_mean": optim_ids_onehot_grad.mean().item(),
-                        # "gradient_std": optim_ids_onehot_grad.std().item(),
-                        # "gradient_max": optim_ids_onehot_grad.max().item(),
-                        "gradient_min": optim_ids_onehot_grad.min().item(),
-                        # "gradient_norm": optim_ids_onehot_grad.norm().item(),
-                    })
+                    self.add_wandb_metric("search_width", new_search_width)
+                    self.add_wandb_metric("gradient_min", optim_ids_onehot_grad.min().item())
 
                 # Compute loss on all candidate sequences
                 batch_size = new_search_width if config.batch_size is None else config.batch_size
@@ -468,54 +484,36 @@ class GCG:
 
             # Log current optimization state to wandb
             if self.using_wandb:
-                if self.config.use_refusal_direction:
-                    # Calculate refusal term for the current best candidate
-                    if hasattr(self, 'activations') and 'target_layer' in self.activations:
-                        token_activations = self.activations['target_layer'][:, :self.config.refusal_num_tokens]
-                        mean_activations = torch.mean(token_activations, dim=1)
-                        norm_activations = mean_activations / (torch.norm(mean_activations, dim=1, keepdim=True) + 1e-6)
-                        refusal_alignments = torch.matmul(norm_activations, self.refusal_vector)
-                        
-                        wandb.log({
-                            "step": step,
-                            "refusal_alignment_mean": refusal_alignments.mean().item(),
-                            "refusal_alignment_std": refusal_alignments.std().item(),
-                            "refusal_alignemment_min": refusal_alignments.min().item(),
-                        })
+                # # Calculate refusal term for the current best candidate
+                # if self.config.use_refusal_direction and hasattr(self, 'activations') and 'target_layer' in self.activations:
+                #     token_activations = self.activations['target_layer'][:, :self.config.refusal_num_tokens]
+                #     mean_activations = torch.mean(token_activations, dim=1)
+                #     norm_activations = mean_activations / (torch.norm(mean_activations, dim=1, keepdim=True) + 1e-6)
+                #     refusal_alignments = torch.matmul(norm_activations, self.refusal_vector)
+                    
+                #     self.add_wandb_metric("refusal_alignment_mean", refusal_alignments.mean().item())
+                #     self.add_wandb_metric("refusal_alignment_std", refusal_alignments.std().item())
+                #     self.add_wandb_metric("refusal_alignment_min", refusal_alignments.min().item())
 
-
-                # Get best loss from buffer
+                # Add loss metrics
                 best_loss = buffer.get_lowest_loss()
+                self.add_wandb_metric("loss", current_loss)
+                self.add_wandb_metric("loss_delta", losses[-2] - current_loss if len(losses) > 1 else 0)
                 
-                # Log metrics
-                wandb.log({
-                    "step": step,
-                    "loss": current_loss,
-                    "loss_delta": losses[-2] - current_loss if len(losses) > 1 else 0,
-                })
-                
-                # Log text data
-                best_string_value = tokenizer.batch_decode(buffer.get_best_ids())[0]
-                # wandb.log({
-                #     "step": step,
-                #     "text/current_string": wandb.Table(data=[[optim_str]], columns=["Content"]),
-                #     # "text/best_string": wandb.Table(data=[[best_string_value]], columns=["Content"]),
-                # })
+                # Add probe sampling metrics if using
+                if self.config.probe_sampling_config is not None and hasattr(self, 'last_rank_correlation'):
+                    self.add_wandb_metric("rank_correlation", self.last_rank_correlation)
+                    self.add_wandb_metric("alpha", (1 + self.last_rank_correlation) / 2)
+
+                # Log all metrics at once
+                self.log_wandb_metrics()
                 
                 # Update summary with latest best string
+                best_string_value = tokenizer.batch_decode(buffer.get_best_ids())[0]
                 wandb.run.summary["best_string"] = best_string_value
                 wandb.run.summary["best_loss"] = best_loss
 
-
-
-                # If using probe sampling, log correlation metrics
-                if self.config.probe_sampling_config is not None and hasattr(self, 'last_rank_correlation'):
-                    wandb.log({
-                        "step": step,
-                        "rank_correlation": self.last_rank_correlation,
-                        "alpha": (1 + self.last_rank_correlation) / 2,
-                    })
-
+                # Generate and log model response periodically
                 if step % 25 == 0:
                     full_prompt = self.config.prompt_string + " " + best_string_value
                     messages = [{"role": "user", "content": full_prompt}]
@@ -538,18 +536,12 @@ class GCG:
             if self.stop_flag:
                 logger.info("Early stopping due to finding a perfect match.")
                 if self.using_wandb:
-                    # wandb.log({"early_stopped": True, "final_step": step})
                     wandb.run.summary["early_stopped"] = True
                 break
 
-
         min_loss_index = losses.index(min(losses))
 
-
-        # generate response and log to wanndb
-        # Generate with the model using the optimized prompt
-        # full_prompt = row['forbidden_prompt'] + " " + best_string
-        # full_prompt = before_str + optim_strings[min_loss_index] + after_str
+        # Generate response and log to wandb
         best_string_value = tokenizer.batch_decode(buffer.get_best_ids())[0]
         full_prompt = self.config.prompt_string + " " + best_string_value
         print(full_prompt)
@@ -574,8 +566,6 @@ class GCG:
         
         if self.using_wandb:
             wandb.run.summary["best_answer"] = response
-
-
 
         result = GCGResult(
             best_loss=losses[min_loss_index],
@@ -645,63 +635,6 @@ class GCG:
 
         return buffer
 
-    # def compute_token_gradient(
-    #     self,
-    #     optim_ids: Tensor,
-    # ) -> Tensor:
-    #     """Computes the gradient of the GCG loss w.r.t the one-hot token matrix.
-
-    #     Args:
-    #         optim_ids : Tensor, shape = (1, n_optim_ids)
-    #             the sequence of token ids that are being optimized
-    #     """
-    #     model = self.model
-    #     embedding_layer = self.embedding_layer
-
-    #     # Create the one-hot encoding matrix of our optimized token ids
-    #     optim_ids_onehot = torch.nn.functional.one_hot(optim_ids, num_classes=embedding_layer.num_embeddings)
-    #     optim_ids_onehot = optim_ids_onehot.to(model.device, model.dtype)
-    #     optim_ids_onehot.requires_grad_()
-
-    #     # (1, num_optim_tokens, vocab_size) @ (vocab_size, embed_dim) -> (1, num_optim_tokens, embed_dim)
-    #     optim_embeds = optim_ids_onehot @ embedding_layer.weight
-
-    #     if self.prefix_cache:
-    #         input_embeds = torch.cat([optim_embeds, self.after_embeds, self.target_embeds], dim=1)
-    #         output = model(
-    #             inputs_embeds=input_embeds,
-    #             past_key_values=self.prefix_cache,
-    #             use_cache=True,
-    #         )
-    #     else:
-    #         input_embeds = torch.cat(
-    #             [
-    #                 self.before_embeds,
-    #                 optim_embeds,
-    #                 self.after_embeds,
-    #                 self.target_embeds,
-    #             ],
-    #             dim=1,
-    #         )
-    #         output = model(inputs_embeds=input_embeds)
-
-    #     logits = output.logits
-
-    #     # Shift logits so token n-1 predicts token n
-    #     shift = input_embeds.shape[1] - self.target_ids.shape[1]
-    #     shift_logits = logits[..., shift - 1 : -1, :].contiguous()  # (1, num_target_ids, vocab_size)
-    #     shift_labels = self.target_ids
-
-    #     if self.config.use_mellowmax:
-    #         label_logits = torch.gather(shift_logits, -1, shift_labels.unsqueeze(-1)).squeeze(-1)
-    #         loss = mellowmax(-label_logits, alpha=self.config.mellowmax_alpha, dim=-1)
-    #     else:
-    #         loss = torch.nn.functional.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-
-    #     optim_ids_onehot_grad = torch.autograd.grad(outputs=[loss], inputs=[optim_ids_onehot])[0]
-
-    #     return optim_ids_onehot_grad
-
     def compute_token_gradient(self, optim_ids: Tensor) -> Tensor:
         """Computes the gradient of the GCG loss w.r.t the one-hot token matrix."""
         model = self.model
@@ -748,62 +681,6 @@ class GCG:
 
         return optim_ids_onehot_grad
 
-
-    # def _compute_candidates_loss_original(
-    #     self,
-    #     search_batch_size: int,
-    #     input_embeds: Tensor,
-    # ) -> Tensor:
-    #     """Computes the GCG loss on all candidate token id sequences.
-
-    #     Args:
-    #         search_batch_size : int
-    #             the number of candidate sequences to evaluate in a given batch
-    #         input_embeds : Tensor, shape = (search_width, seq_len, embd_dim)
-    #             the embeddings of the `search_width` candidate sequences to evaluate
-    #     """
-    #     all_loss = []
-    #     prefix_cache_batch = []
-
-    #     for i in range(0, input_embeds.shape[0], search_batch_size):
-    #         with torch.no_grad():
-    #             input_embeds_batch = input_embeds[i:i + search_batch_size]
-    #             current_batch_size = input_embeds_batch.shape[0]
-
-    #             if self.prefix_cache:
-    #                 if not prefix_cache_batch or current_batch_size != search_batch_size:
-    #                     prefix_cache_batch = [[x.expand(current_batch_size, -1, -1, -1) for x in self.prefix_cache[i]] for i in range(len(self.prefix_cache))]
-
-    #                 outputs = self.model(inputs_embeds=input_embeds_batch, past_key_values=prefix_cache_batch, use_cache=True)
-    #             else:
-    #                 outputs = self.model(inputs_embeds=input_embeds_batch)
-
-    #             logits = outputs.logits
-
-    #             tmp = input_embeds.shape[1] - self.target_ids.shape[1]
-    #             shift_logits = logits[..., tmp-1:-1, :].contiguous()
-    #             shift_labels = self.target_ids.repeat(current_batch_size, 1)
-
-    #             if self.config.use_mellowmax:
-    #                 label_logits = torch.gather(shift_logits, -1, shift_labels.unsqueeze(-1)).squeeze(-1)
-    #                 loss = mellowmax(-label_logits, alpha=self.config.mellowmax_alpha, dim=-1)
-    #             else:
-    #                 loss = torch.nn.functional.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), reduction="none")
-
-    #             loss = loss.view(current_batch_size, -1).mean(dim=-1)
-    #             all_loss.append(loss)
-
-    #             if self.config.early_stop:
-    #                 if torch.any(torch.all(torch.argmax(shift_logits, dim=-1) == shift_labels, dim=-1)).item():
-    #                     self.stop_flag = True
-
-    #             del outputs
-    #             gc.collect()
-    #             torch.cuda.empty_cache()
-
-    #     return torch.cat(all_loss, dim=0)
-
-
     def _compute_candidates_loss_original(self, search_batch_size: int, input_embeds: Tensor) -> Tensor:
         """Computes the GCG loss on all candidate token id sequences."""
         all_loss = []
@@ -825,6 +702,8 @@ class GCG:
                 logits = outputs.logits
 
                 tmp = input_embeds.shape[1] - self.target_ids.shape[1]
+                shift_logits = logits
+                tmp = input_embeds.shape[1] - self.target_ids.shape[1]
                 shift_logits = logits[..., tmp-1:-1, :].contiguous()
                 shift_labels = self.target_ids.repeat(current_batch_size, 1)
 
@@ -841,7 +720,6 @@ class GCG:
                 torch.cuda.empty_cache()
 
         return torch.cat(all_loss, dim=0)
-
 
     def _compute_candidates_loss_probe_sampling(
         self,
@@ -996,7 +874,6 @@ class GCG:
 
         self.last_rank_correlation = rank_correlation
 
-
         # Step 4. Calculate the filtered set and evaluate using the target model.
         R = probe_sampling_config.r
         filtered_size = int((1 - alpha) * B / R)
@@ -1011,18 +888,16 @@ class GCG:
         best_probe_loss = probe_losses.min().item()
         best_filtered_loss = filtered_losses.min().item()
 
-
+        # Add metrics for wandb
         if self.using_wandb:
-            wandb.log({
-                "probe_sampling/rank_correlation": rank_correlation,
-                "probe_sampling/alpha": alpha,
-                "probe_sampling/probe_size": probe_size,
-                "probe_sampling/filtered_size": filtered_size,
-                "probe_sampling/best_probe_loss": best_probe_loss,
-                "probe_sampling/mean_probe_loss": probe_losses.mean().item(),
-                "probe_sampling/mean_draft_loss": draft_losses.mean().item(),
-                "probe_sampling/best_filtered_loss": best_filtered_loss,
-            })
+            self.add_wandb_metric("probe_sampling/rank_correlation", rank_correlation)
+            self.add_wandb_metric("probe_sampling/alpha", alpha)
+            self.add_wandb_metric("probe_sampling/probe_size", probe_size)
+            self.add_wandb_metric("probe_sampling/filtered_size", filtered_size)
+            self.add_wandb_metric("probe_sampling/best_probe_loss", best_probe_loss)
+            self.add_wandb_metric("probe_sampling/mean_probe_loss", probe_losses.mean().item())
+            self.add_wandb_metric("probe_sampling/mean_draft_loss", draft_losses.mean().item())
+            self.add_wandb_metric("probe_sampling/best_filtered_loss", best_filtered_loss)
 
         probe_ids = sampled_ids[probe_idxs]
         filtered_ids = sampled_ids[top_indices]
@@ -1035,7 +910,6 @@ class GCG:
                 filtered_ids[filtered_losses.argmin()].unsqueeze(0),
             )
         )
-
 
     def register_activation_hooks(self):
         """Register hooks to extract activations from specified layers."""
@@ -1073,7 +947,7 @@ class GCG:
 
 
     def compute_loss_with_refusal_direction(self, shift_logits, shift_labels):
-        """Compute loss with optional refusal direction component."""
+        """Compute loss with optional refusal direction component using scheduled beta."""
         
         # Original loss calculation (cross-entropy or mellowmax)
         if self.config.use_mellowmax:
@@ -1086,6 +960,19 @@ class GCG:
                 reduction="none"
             ).view(shift_logits.shape[0], -1).mean(dim=-1)
         
+        # Store original loss metrics for wandb
+        if self.using_wandb:
+            self.add_wandb_metric("token_force_loss_mean", original_loss.mean().item())
+            self.add_wandb_metric("token_force_loss_std", original_loss.std().item())
+            self.add_wandb_metric("token_force_loss_min", original_loss.min().item())
+
+        # Get current refusal beta value based on schedule
+        current_beta = self.get_current_refusal_beta()
+        
+        # If using wandb, log the current beta value
+        if self.using_wandb:
+            self.add_wandb_metric("refusal_beta", current_beta)
+
         # Compute refusal direction term if enabled and activations are available
         refusal_term = None
         if self.config.use_refusal_direction and hasattr(self, 'activations') and 'target_layer' in self.activations:
@@ -1095,26 +982,91 @@ class GCG:
             # Average across tokens for each example
             mean_activations = torch.mean(token_activations, dim=1)
             
-            # Normalize for cosine similarity-like behavior
-            norm_activations = mean_activations / (torch.norm(mean_activations, dim=1, keepdim=True) + 1e-6)
+            refusal_term = mean_activations @ self.refusal_vector 
+            # ^ matmul should implement dot product across the batch dimension
+
+
+            # Take absolute value for minimization
+            # refusal_term = 1 / torch.abs(refusal_term) 
             
-            # Compute dot product with refusal direction
-            refusal_term = torch.matmul(norm_activations, self.refusal_vector)
-            
-            # # For minimization, we want lower dot product values
-            # if self.using_wandb:
-            #     # Log the refusal term value
-            #     wandb.log({"refusal_term": refusal_term.item()})
+            refusal_term = torch.abs(refusal_term)
+
+            # Add refusal term metrics for wandb
+            if self.using_wandb:
+                self.add_wandb_metric("refusal_term_mean", refusal_term.mean().item())
+                self.add_wandb_metric("refusal_term_min", refusal_term.min().item())
+                self.add_wandb_metric("refusal_term_max", refusal_term.max().item())
         
-        # Combine losses or return just the refusal term
+        # Combine losses or return just the original loss
         if self.config.use_refusal_direction and refusal_term is not None:
-            if self.config.combine_losses:
-                return original_loss + self.config.refusal_weight * refusal_term
-            else:
-                return refusal_term
+            combined_loss = (1 - current_beta) * original_loss + current_beta * refusal_term
+            
+            # Log combined loss metrics for wandb
+            if self.using_wandb:
+                self.add_wandb_metric("combined_loss_mean", combined_loss.mean().item())
+                self.add_wandb_metric("combined_loss_min", combined_loss.min().item())
+            
+            return combined_loss
         else:
             return original_loss
 
+
+    def get_current_refusal_beta(self):
+        """Get the current refusal beta value based on the selected schedule."""
+        
+        # If not using refusal direction or scheduling, just return the fixed beta
+        if not self.config.use_refusal_direction or not self.config.use_refusal_beta_schedule:
+            return self.config.refusal_beta
+        
+        # Determine end step for schedule
+        end_step = self.config.schedule_end_step if self.config.schedule_end_step is not None else self.config.num_steps
+        
+        # Make sure start_step is less than end_step
+        start_step = min(self.config.schedule_start_step, end_step - 1)
+        
+        # If we're before the start of the schedule, use the start value
+        if self.step < start_step:
+            return self.config.refusal_beta_start
+        
+        # If we're after the end of the schedule, use the end value
+        if self.step >= end_step:
+            return self.config.refusal_beta_end
+        
+        # Determine current step within the schedule
+        current_schedule_step = self.step - start_step
+        total_schedule_steps = end_step - start_step
+        
+        # Apply the appropriate schedule
+        if self.config.schedule_type.lower() == "linear":
+            from nanogcg.utils import linear_schedule
+            return linear_schedule(
+                self.config.refusal_beta_start,
+                self.config.refusal_beta_end,
+                current_schedule_step,
+                total_schedule_steps
+            )
+        elif self.config.schedule_type.lower() == "exponential":
+            from nanogcg.utils import exponential_schedule
+            return exponential_schedule(
+                self.config.refusal_beta_start,
+                self.config.refusal_beta_end,
+                current_schedule_step,
+                total_schedule_steps,
+                exponent=self.config.schedule_exponent
+            )
+        elif self.config.schedule_type.lower() == "power":
+            from nanogcg.utils import power_schedule
+            return power_schedule(
+                self.config.refusal_beta_start,
+                self.config.refusal_beta_end,
+                current_schedule_step,
+                total_schedule_steps,
+                power=self.config.schedule_power
+            )
+        else:
+            logger.warning(f"Unknown schedule type: {self.config.schedule_type}. Using fixed beta.")
+            return self.config.refusal_beta
+        
 
 # A wrapper around the GCG `run` method that provides a simple API
 def run(
