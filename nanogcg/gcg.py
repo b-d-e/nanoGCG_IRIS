@@ -89,6 +89,7 @@ class GCGConfig:
     refusal_layers: Optional[List[int]] = None  # Which layers to use (default: all)
     average_across_layers: bool = False  # Average instead of sum across layers
     iris_normalisation_constant: float = 33 # because iris loss term is otherwise massively higher
+    end_think_id: Optional[int] = 128014  # ID of the end-think token, defaults to DeepSeek tokenizer </think>
 
     # New scheduling parameters
     use_refusal_beta_schedule: bool = False
