@@ -25,14 +25,21 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import nanogcg
 from nanogcg import GCGConfig, ProbeSamplingConfig
 
+RESULTS_DIR = "results"
+if not os.path.exists(RESULTS_DIR):
+    os.makedirs(RESULTS_DIR)
 
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="Run GCG attacks on a dataset.")
-    parser.add_argument("--input-csv", type=str, default="../orthogonalized_outputs_2048.csv",
+    parser.add_argument("--input-csv", type=str, default="../strongreject_target_responses.csv",
                         help="Path to the input CSV file.")
-    parser.add_argument("--output-csv", type=str, default="gcg_attacks_results.csv",
-                        help="Path to save the output CSV file.")
+    # parser.add_argument("--output-csv", type=str, default="gcg_attacks_results.csv",
+                        # help="Path to save the output CSV file.")
+    parser.add_argument("--use-csv-targets", action="store_true", default=True, 
+                        help="Use CSV targets instead of procedurally generated.")
+    parser.add_argument("--target-skip-think", action="store_true", default=False,
+                        help="Force </think> at the start of the target response.")
     parser.add_argument("--model", type=str, default="deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
                         help="Victim model to use.")
     parser.add_argument("--dtype", type=str, default="float16",
@@ -40,9 +47,11 @@ def parse_args():
                         help="Data type for model loading.")
     parser.add_argument("--num-gpus", type=int, default=4,
                         help="Number of GPUs to use.")
-    parser.add_argument("--model-memory-upper-bound-gb", type=int, default=30, # generous estimate
+    parser.add_argument("--specific-gpus", type=str, default="0,1,2,3",
+                        help="Comma-separated list of specific GPUs to use.")
+    parser.add_argument("--model-memory-upper-bound-gb", type=int, default=26, # generous estimate 24
                         help="Estimated memory usage per model in GB.")
-    parser.add_argument("--gpu-memory-lower-bound-gb", type=int, default=90-18,
+    parser.add_argument("--gpu-memory-lower-bound-gb", type=int, default=80,
                         help="Minimum available memory per GPU in GB.")
     parser.add_argument("--max-tokens", type=int, default=2048,
                         help="Max tokens for generation.")
@@ -58,7 +67,7 @@ def parse_args():
                         help="Use probe sampling for GCG.")
     parser.add_argument("--early-stop", action="store_true",
                         help="Early stop GCG if a perfect match is found.")
-    parser.add_argument("--num-steps", type=int, default=250,
+    parser.add_argument("--num-steps", type=int, default=150,
                         help="Number of GCG optimization steps.")
     parser.add_argument("--hf-cache-dir", type=str, default="/scratch/etheridge/huggingface/",
                         help="HuggingFace cache directory.")
@@ -76,6 +85,7 @@ def run_attack(gpu_id, job_queue, result_queue, args):
         result_queue: Queue to store results
         args: Command line arguments
     """
+    
     # Set the device
     device = f"cuda:{gpu_id}"
     print(f"Worker {gpu_id} starting on device {device}")
@@ -126,7 +136,7 @@ def run_attack(gpu_id, job_queue, result_queue, args):
                     run_name = f"row_{idx}_{row['forbidden_prompt'].split('.')[0]}"
                     wandb_config = {
                         "entity": args.wandb_entity,
-                        "project": args.wandb_project,
+                        "project": args.wandb_project,#+args.timestamp,
                         "name": run_name,
                     }
                 
@@ -137,6 +147,10 @@ def run_attack(gpu_id, job_queue, result_queue, args):
                     num_steps=args.num_steps,
                     wandb_config=wandb_config,
                     seed=42,
+                    run_id = args.timestamp,
+                    prompt_string = row['forbidden_prompt'],
+                    target_string = row['gcg_target'],
+                    target_no_think=args.target_skip_think,
                 )
                 
                 # Run GCG
@@ -153,25 +167,25 @@ def run_attack(gpu_id, job_queue, result_queue, args):
                 best_string = result.best_string
                 best_loss = result.best_loss
                 
-                # Generate with the model using the optimized prompt
-                full_prompt = row['forbidden_prompt'] + " " + best_string
-                messages = [{"role": "user", "content": full_prompt}]
-                input_tensor = tokenizer.apply_chat_template(
-                    messages, 
-                    add_generation_prompt=True, 
-                    return_tensors="pt"
-                ).to(device)
+                # # Generate with the model using the optimized prompt
+                # full_prompt = row['forbidden_prompt'] + " " + best_string
+                # messages = [{"role": "user", "content": full_prompt}]
+                # input_tensor = tokenizer.apply_chat_template(
+                #     messages, 
+                #     add_generation_prompt=True, 
+                #     return_tensors="pt"
+                # ).to(device)
                 
-                output = model.generate(
-                    input_tensor, 
-                    do_sample=False, 
-                    max_new_tokens=args.max_tokens
-                )
+                # output = model.generate(
+                #     input_tensor, 
+                #     do_sample=False, 
+                #     max_new_tokens=args.max_tokens
+                # )
                 
-                response = tokenizer.batch_decode(
-                    output[:, input_tensor.shape[1]:], 
-                    skip_special_tokens=True
-                )[0]
+                # response = tokenizer.batch_decode(
+                #     output[:, input_tensor.shape[1]:], 
+                #     skip_special_tokens=True
+                # )[0]
                 
                 elapsed_time = time.time() - start_time
                 print(f"Worker {gpu_id} finished row {idx} in {elapsed_time:.2f}s")
@@ -180,7 +194,7 @@ def run_attack(gpu_id, job_queue, result_queue, args):
                 result_queue.put((idx, {
                     'gcg_best_string': best_string,
                     'gcg_best_loss': best_loss,
-                    'gcg_response': response,
+                    'gcg_response': result.best_answer,
                     'gcg_execution_time': elapsed_time
                 }))
                 
@@ -210,7 +224,31 @@ def run_attack(gpu_id, job_queue, result_queue, args):
 def main():
     """Main function."""
     args = parse_args()
-    
+
+    print("Arguments:")
+    for key, value in vars(args).items():
+        print(f"  {key}: {value}")
+
+    input("Go / abort...")
+    args.timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    args.output_csv = os.path.join(
+        RESULTS_DIR,
+        f"{args.timestamp}.csv"
+    )
+
+    # Parse specific GPUs if provided
+    if hasattr(args, "specific_gpus") and args.specific_gpus:
+        # Convert comma-separated string to list of integers
+        gpu_ids = [int(gpu_id.strip()) for gpu_id in args.specific_gpus.split(',')]
+        print(f"Using specific GPUs: {gpu_ids}")
+        # Update num_gpus to match the actual number of GPUs
+        args.num_gpus = len(gpu_ids)
+    else:
+        # Default behavior: use consecutive GPU IDs
+        gpu_ids = list(range(args.num_gpus))
+        print(f"Using consecutive GPUs: {gpu_ids}")
+
+
     # Calculate number of attacks per GPU
     attacks_per_gpu = args.gpu_memory_lower_bound_gb // args.model_memory_upper_bound_gb
     print(f"Will run {attacks_per_gpu} attacks per GPU on {args.num_gpus} GPUs")
@@ -225,11 +263,35 @@ def main():
         df = df.head(args.num_samples)
     
     # Add GCG target column - first two sentences of 'response'
+    
+
+    # find which row is a float and remove it
+    # print(df['response'].apply(lambda x: isinstance(x, float)))
+    df = df[~df['response'].apply(lambda x: isinstance(x, float))]
+
     # df['gcg_target'] = df['response'].apply(
-    #     lambda x: x.split(". ")[0] + ". " + x.split(". ")[1] + "."
+    #     lambda x: x.split(". ")[0] #+ ". " + x.split(". ")[1] + "."
     # )
     # Add GCG target - "Sure, here is" to all rows
-    df['gcg_target'] = "Sure, here is"
+
+    df['gcg_target'] = "" 
+
+    if args.target_skip_think:
+        print("Skipping reasoning via forced </think> immediately")
+        df['gcg_target'] += "</think>\n"
+    #     # df['gcg_target'] += "<think>\n\n</think>\n" # deepseek sepcific - are the newlines right?
+    #     print("Adding </think> to target responses")
+    #     # df['gcg_target'] += "</think>\n\n"
+    #     df['gcg_target'] += "</think>\n"
+    # df['gcg_target'] += "Sure, here is"
+    if args.use_csv_targets:
+        df['gcg_target'] += df['target_response_no_think_colon']
+    #     df['gcg_target'] = "Okay, this is something I can answer!"
+    else:
+    #     print("Defaulting to '' for all target responses")
+        df['gcg_target'] += "Sure, here"
+        
+    print(df['gcg_target'].head())
     
     # Add result columns
     df['gcg_best_string'] = ""
@@ -262,7 +324,8 @@ def main():
     
     # Start worker processes
     processes = []
-    for gpu_id in range(args.num_gpus):
+    # for gpu_id in range(args.num_gpus):
+    for gpu_id in gpu_ids:
         for i in range(attacks_per_gpu):
             p = Process(
                 target=run_attack, 
