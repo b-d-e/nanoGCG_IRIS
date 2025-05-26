@@ -1,3 +1,8 @@
+
+> [!CAUTION]
+> Work-in-progress repository.
+> This README has not yet been updated for the new attack configuration, so portions of it are incorrect.
+
 ![](./assets/nanogcg.png)
 
 # nanoGCG
