@@ -73,20 +73,25 @@ class GCGConfig:
     target_string: Optional[str] = None
     target_no_think: Optional[bool] = None
 
-    example_generation_frequency: int = 10  # How often to generate examples
-
+    # Adversarial positioning options
+    use_prefix: bool = False  # If True, use adversarial prefix instead of suffix
+    example_generation_frequency: int = 25  # How often to generate examples during optimization
+    
     # refusal direction minimisation terms
     use_refusal_direction: bool = False
     refusal_vector_path: Optional[str] = None
     refusal_vector: Optional[torch.Tensor] = None
-    refusal_layer_idx: int = 17  # Default to layer 17
-    refusal_num_tokens: int = 10  # Number of CoT tokens to use
+    refusal_layer_idx: Union[int, List[int]] = 17  # Single layer (int), list of layers, or empty list for all layers
+    refusal_num_tokens: int = 10  # Number of CoT tokens to use for refusal calculation
     refusal_beta: float = 0.75  # weight balancing term
+    promote_caution: bool = False  # If True, maximize refusal alignment instead of minimizing
     
-    promote_caution: bool = False  # Whether to promote caution in the refusal direction, instead of minimise it
-
+    # Extended generation for refusal calculation
+    refusal_generation_length: int = 50  # How many additional tokens to generate for refusal calculation
+    use_extended_generation: bool = True  # Whether to generate additional tokens beyond target for refusal calc
+    
     # Option to average across all layers instead of using specific layer
-    refusal_average_all_layers: bool = False
+    refusal_average_all_layers: bool = False  # DEPRECATED: Use refusal_layer_idx=[] instead
     
     # CoT detection tokens
     think_start_token: str = "<think>"
@@ -328,28 +333,43 @@ class GCG:
         # Clear existing hooks
         self._remove_activation_hooks()
         
-        if self.config.refusal_average_all_layers:
-            # Hook all layers
-            if hasattr(self.model, 'model') and hasattr(self.model.model, 'layers'):
-                for i, layer in enumerate(self.model.model.layers):
-                    if hasattr(layer, 'input_layernorm'):
-                        hook = layer.input_layernorm.register_forward_hook(get_activation_hook(i))
-                        self.activation_hooks.append(hook)
-                logger.info(f"Registered hooks for all {len(self.model.model.layers)} layers")
+        # Determine which layers to hook based on refusal_layer_idx
+        if isinstance(self.config.refusal_layer_idx, int):
+            # Single layer
+            target_layers = [self.config.refusal_layer_idx]
+        elif isinstance(self.config.refusal_layer_idx, list):
+            if len(self.config.refusal_layer_idx) == 0:
+                # Empty list means all layers
+                if hasattr(self.model, 'model') and hasattr(self.model.model, 'layers'):
+                    target_layers = list(range(len(self.model.model.layers)))
+                else:
+                    logger.warning("Cannot determine model layers for empty refusal_layer_idx list")
+                    target_layers = []
+            else:
+                # Specific list of layers
+                target_layers = self.config.refusal_layer_idx
         else:
-            # Hook specific layer
-            layer_idx = self.config.refusal_layer_idx
-            if hasattr(self.model, 'model') and hasattr(self.model.model, 'layers'):
-                if layer_idx < len(self.model.model.layers):
+            logger.error(f"Invalid refusal_layer_idx type: {type(self.config.refusal_layer_idx)}")
+            target_layers = []
+        
+        # Register hooks for target layers
+        if hasattr(self.model, 'model') and hasattr(self.model.model, 'layers'):
+            total_layers = len(self.model.model.layers)
+            
+            for layer_idx in target_layers:
+                if 0 <= layer_idx < total_layers:
                     layer = self.model.model.layers[layer_idx]
                     if hasattr(layer, 'input_layernorm'):
                         hook = layer.input_layernorm.register_forward_hook(get_activation_hook(layer_idx))
                         self.activation_hooks.append(hook)
-                        logger.info(f"Registered hook for layer {layer_idx}")
                     else:
                         logger.warning(f"Layer {layer_idx} doesn't have input_layernorm")
                 else:
-                    logger.error(f"Layer index {layer_idx} out of bounds")
+                    logger.warning(f"Layer index {layer_idx} out of bounds (model has {total_layers} layers)")
+            
+            logger.info(f"Registered hooks for layers: {[idx for idx in target_layers if 0 <= idx < total_layers]}")
+        else:
+            logger.error("Cannot access model layers for hook registration")
 
     def _remove_activation_hooks(self):
         """Remove all activation hooks."""
@@ -390,10 +410,11 @@ class GCG:
 
     def _compute_cot_refusal_loss(self, input_embeds: Tensor) -> Optional[Tensor]:
         """
-        Compute refusal loss based on first n CoT tokens.
+        Compute refusal loss based on target tokens + additional generated tokens up to refusal_num_tokens.
         
         Args:
-            input_embeds: Input embeddings [batch_size, seq_len, hidden_dim]
+            input_embeds: Input embeddings [batch_size, seq_len, hidden_dim] 
+                         (may include additional generated tokens beyond target)
             
         Returns:
             Refusal loss term or None if CoT tokens not found
@@ -403,63 +424,94 @@ class GCG:
         
         batch_size = input_embeds.shape[0]
         seq_len = input_embeds.shape[1]
+        target_length = self.target_ids.shape[1]
         
-        # We need to determine where CoT starts in the sequence
-        # For this, we'll make an assumption about the sequence structure:
-        # [before_embeds] + [optim_embeds] + [after_embeds] + [target_embeds]
-        # The target_embeds part is where CoT reasoning happens
+        # Calculate the base sequence length (without any additional generated tokens)
+        if self.prefix_cache:
+            # Prefix cache case: [optim] + [after] + [target]
+            base_length = input_embeds.shape[1]
+            # If we have the stored original target embeddings, we can calculate the base
+            original_base_length = self.after_embeds.shape[1] + target_length
+            # Additional tokens = current length - original base length
+            additional_tokens_available = max(0, seq_len - original_base_length)
+        else:
+            # Non-prefix case: [before] + [optim] + [after] + [target]  
+            original_base_length = self.before_embeds.shape[1] + self.after_embeds.shape[1] + target_length
+            additional_tokens_available = max(0, seq_len - original_base_length)
         
-        target_start_pos = seq_len - self.target_ids.shape[1]
+        # Find where the target sequence starts
+        target_start_pos = seq_len - target_length - additional_tokens_available
+        
+        # Calculate how many tokens we can use for refusal calculation
+        total_available_tokens = target_length + additional_tokens_available
+        actual_tokens_to_use = min(self.config.refusal_num_tokens, total_available_tokens)
+        
+        # Debug logging
+        if self.using_wandb and self.step % 10 == 0:
+            self.add_wandb_metric("debug/seq_len", seq_len)
+            self.add_wandb_metric("debug/target_length", target_length)
+            self.add_wandb_metric("debug/additional_tokens_available", additional_tokens_available)
+            self.add_wandb_metric("debug/total_available_tokens", total_available_tokens)
+            self.add_wandb_metric("debug/target_start_pos", target_start_pos)
+            self.add_wandb_metric("debug/requested_refusal_tokens", self.config.refusal_num_tokens)
+            self.add_wandb_metric("debug/actual_tokens_to_use", actual_tokens_to_use)
+            self.add_wandb_metric("debug/using_prefix_cache", self.prefix_cache is not None)
+        
+        if actual_tokens_to_use <= 0:
+            logger.warning(f"No tokens available for refusal loss computation")
+            return None
+        
+        if actual_tokens_to_use < self.config.refusal_num_tokens and self.step == 0:
+            logger.info(f"Requested {self.config.refusal_num_tokens} refusal tokens, using {actual_tokens_to_use} (target: {target_length}, additional: {additional_tokens_available})")
         
         # Look for CoT tokens in the activations
-        cot_losses = []
+        total_loss = 0.0
+        valid_layers = 0
         
-        if self.config.refusal_average_all_layers:
-            # Average across all layers
-            total_loss = 0.0
-            valid_layers = 0
+        for layer_idx, activation in self.layer_activations.items():
+            if activation.shape[1] != seq_len:
+                logger.warning(f"Layer {layer_idx}: activation length {activation.shape[1]} != seq_len {seq_len}")
+                continue
+                
+            # Extract the refusal region starting from target tokens
+            refusal_end_pos = target_start_pos + actual_tokens_to_use
+            refusal_region = activation[:, target_start_pos:refusal_end_pos]
             
-            for layer_idx, activation in self.layer_activations.items():
-                if activation.shape[1] != seq_len:
-                    continue
-                    
-                # Extract first n tokens from target region
-                cot_region = activation[:, target_start_pos:target_start_pos + self.config.refusal_num_tokens]
-                if cot_region.shape[1] == 0:
-                    continue
-                    
-                # Compute dot products for each token and each batch element
-                # cot_region: [batch_size, num_cot_tokens, hidden_dim]
-                # refusal_vector: [hidden_dim]
-                dot_products = torch.matmul(cot_region, self.refusal_vector)  # [batch_size, num_cot_tokens]
+            if refusal_region.shape[1] != actual_tokens_to_use:
+                logger.warning(f"Layer {layer_idx}: Expected {actual_tokens_to_use} tokens, got {refusal_region.shape[1]} (start: {target_start_pos}, end: {refusal_end_pos})")
+                continue
                 
-                # Square and average across tokens
-                squared_dots = dot_products ** 2  # [batch_size, num_cot_tokens]
-                layer_loss = squared_dots.mean(dim=1)  # [batch_size]
-                
-                total_loss = total_loss + layer_loss
-                valid_layers += 1
+            # Compute dot products for each token and each batch element
+            # refusal_region: [batch_size, actual_tokens_to_use, hidden_dim]
+            # refusal_vector: [hidden_dim]
+            dot_products = torch.matmul(refusal_region, self.refusal_vector)  # [batch_size, actual_tokens_to_use]
             
-            if valid_layers > 0:
-                return total_loss / valid_layers
-        else:
-            # Use specific layer
-            layer_idx = self.config.refusal_layer_idx
-            if layer_idx in self.layer_activations:
-                activation = self.layer_activations[layer_idx]
-                
-                if activation.shape[1] == seq_len:
-                    # Extract first n tokens from target region
-                    cot_region = activation[:, target_start_pos:target_start_pos + self.config.refusal_num_tokens]
-                    
-                    if cot_region.shape[1] > 0:
-                        # Compute dot products
-                        dot_products = torch.matmul(cot_region, self.refusal_vector)  # [batch_size, num_cot_tokens]
-                        
-                        # Square and average across tokens
-                        squared_dots = dot_products ** 2
-                        return squared_dots.mean(dim=1)  # [batch_size]
+            # Square and average across tokens
+            squared_dots = dot_products ** 2  # [batch_size, actual_tokens_to_use]
+            layer_loss = squared_dots.mean(dim=1)  # [batch_size]
+            
+            total_loss = total_loss + layer_loss
+            valid_layers += 1
+            
+            # Debug logging for first layer
+            if self.using_wandb and layer_idx == list(self.layer_activations.keys())[0] and self.step % 10 == 0:
+                self.add_wandb_metric("debug/refusal_region_shape_1", refusal_region.shape[1])
+                self.add_wandb_metric("debug/dot_products_mean", dot_products.mean().item())
+                self.add_wandb_metric("debug/dot_products_std", dot_products.std().item())
+                self.add_wandb_metric("debug/refusal_start_pos", target_start_pos)
+                self.add_wandb_metric("debug/refusal_end_pos", refusal_end_pos)
         
+        if valid_layers > 0:
+            # Average across layers
+            final_loss = total_loss / valid_layers
+            
+            if self.using_wandb and self.step % 10 == 0:
+                self.add_wandb_metric("debug/valid_layers_count", valid_layers)
+                self.add_wandb_metric("debug/final_refusal_loss", final_loss.mean().item())
+            
+            return final_loss
+        
+        logger.warning("No valid layers found for refusal loss computation")
         return None
     
     def add_wandb_metric(self, name: str, value: Any) -> None:
@@ -497,9 +549,14 @@ class GCG:
         else:
             messages = copy.deepcopy(messages)
 
-        # Append the GCG string at the end of the prompt if location not specified
+        # Append the GCG string at the appropriate location
         if not any(["{optim_str}" in d["content"] for d in messages]):
-            messages[-1]["content"] = messages[-1]["content"] + "{optim_str}"
+            if config.use_prefix:
+                # Add as prefix: {optim_str} + original_content
+                messages[-1]["content"] = "{optim_str}" + messages[-1]["content"]
+            else:
+                # Add as suffix: original_content + {optim_str} (original behavior)
+                messages[-1]["content"] = messages[-1]["content"] + "{optim_str}"
 
         template = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         # Remove the BOS token -- this will get added when tokenizing, if necessary
@@ -647,7 +704,7 @@ class GCG:
                 wandb.run.summary["best_loss"] = best_loss
 
                 # Generate and log model response periodically
-                if step % self.config.example_generation_frequency == 0:
+                if step % config.example_generation_frequency == 0:
                     full_prompt = self.config.prompt_string + " " + best_string_value
                     messages = [{"role": "user", "content": full_prompt}]
                     input_tensor = tokenizer.apply_chat_template(
@@ -784,13 +841,56 @@ class GCG:
         # (1, num_optim_tokens, vocab_size) @ (vocab_size, embed_dim) -> (1, num_optim_tokens, embed_dim)
         optim_embeds = optim_ids_onehot @ embedding_layer.weight
 
+        # Calculate how many additional tokens we need beyond target for refusal calculation
+        target_length = self.target_ids.shape[1]
+        additional_tokens_needed = max(0, self.config.refusal_num_tokens - target_length)
+
         if self.prefix_cache:
             input_embeds = torch.cat([optim_embeds, self.after_embeds, self.target_embeds], dim=1)
-            output = model(
-                inputs_embeds=input_embeds,
-                past_key_values=self.prefix_cache,
-                use_cache=True,
-            )
+            
+            # Generate additional tokens if needed for refusal calculation
+            if self.config.use_refusal_direction and additional_tokens_needed > 0:
+                # First, get the basic output with target tokens
+                output = model(
+                    inputs_embeds=input_embeds,
+                    past_key_values=self.prefix_cache,
+                    use_cache=True,
+                )
+                
+                # Now generate additional tokens for refusal calculation
+                extended_embeds = input_embeds.clone()
+                current_kv_cache = output.past_key_values
+                
+                for _ in range(additional_tokens_needed):
+                    # Get logits for the last position
+                    last_logits = output.logits[:, -1:, :]  # [batch_size, 1, vocab_size]
+                    
+                    # Sample next token (using argmax for deterministic behavior during gradient computation)
+                    next_token_id = torch.argmax(last_logits, dim=-1)  # [batch_size, 1]
+                    next_token_embed = embedding_layer(next_token_id)  # [batch_size, 1, embed_dim]
+                    
+                    # Append to sequence
+                    extended_embeds = torch.cat([extended_embeds, next_token_embed], dim=1)
+                    
+                    # Continue generation
+                    output = model(
+                        inputs_embeds=next_token_embed,
+                        past_key_values=current_kv_cache,
+                        use_cache=True,
+                    )
+                    current_kv_cache = output.past_key_values
+                
+                # Use the extended sequence for final loss calculation
+                final_output = model(inputs_embeds=extended_embeds, past_key_values=self.prefix_cache, use_cache=True)
+                self.current_extended_embeds = extended_embeds
+                
+            else:
+                final_output = model(
+                    inputs_embeds=input_embeds,
+                    past_key_values=self.prefix_cache,
+                    use_cache=True,
+                )
+                self.current_extended_embeds = input_embeds
         else:
             input_embeds = torch.cat(
                 [
@@ -801,17 +901,37 @@ class GCG:
                 ],
                 dim=1,
             )
-            output = model(inputs_embeds=input_embeds)
+            
+            # Generate additional tokens if needed for refusal calculation
+            if self.config.use_refusal_direction and additional_tokens_needed > 0:
+                extended_embeds = input_embeds.clone()
+                
+                for _ in range(additional_tokens_needed):
+                    output = model(inputs_embeds=extended_embeds)
+                    last_logits = output.logits[:, -1:, :]
+                    next_token_id = torch.argmax(last_logits, dim=-1)
+                    next_token_embed = embedding_layer(next_token_id)
+                    extended_embeds = torch.cat([extended_embeds, next_token_embed], dim=1)
+                
+                final_output = model(inputs_embeds=extended_embeds)
+                self.current_extended_embeds = extended_embeds
+            else:
+                final_output = model(inputs_embeds=input_embeds)
+                self.current_extended_embeds = input_embeds
 
-        logits = output.logits
+        logits = final_output.logits
 
-        # Shift logits so token n-1 predicts token n
-        shift = input_embeds.shape[1] - self.target_ids.shape[1]
-        shift_logits = logits[..., shift - 1 : -1, :].contiguous()  # (1, num_target_ids, vocab_size)
+        # Token forcing loss: ONLY over the target tokens (no change from original)
+        # We need to calculate based on the original input length, not extended length
+        original_input_length = input_embeds.shape[1]  # Original sequence length
+        shift = original_input_length - self.target_ids.shape[1]
+        
+        # Extract logits for target tokens only, regardless of additional generation
+        shift_logits = logits[..., shift - 1 : shift - 1 + self.target_ids.shape[1], :].contiguous()
         shift_labels = self.target_ids
 
-        # Compute loss with refusal direction
-        loss = self.compute_loss_with_refusal_direction(shift_logits, shift_labels, input_embeds)
+        # Compute loss with refusal direction (refusal calculation uses extended sequence if available)
+        loss = self.compute_loss_with_refusal_direction(shift_logits, shift_labels, self.current_extended_embeds)
 
         optim_ids_onehot_grad = torch.autograd.grad(outputs=[loss], inputs=[optim_ids_onehot])[0]
 
@@ -830,22 +950,80 @@ class GCG:
                 input_embeds_batch = input_embeds[i:i + search_batch_size]
                 current_batch_size = input_embeds_batch.shape[0]
 
+                # Calculate if we need additional tokens for refusal calculation
+                target_length = self.target_ids.shape[1]
+                additional_tokens_needed = max(0, self.config.refusal_num_tokens - target_length) if self.config.use_refusal_direction else 0
+
                 if self.prefix_cache:
                     if not prefix_cache_batch or current_batch_size != search_batch_size:
                         prefix_cache_batch = [[x.expand(current_batch_size, -1, -1, -1) for x in self.prefix_cache[i]] for i in range(len(self.prefix_cache))]
 
-                    outputs = self.model(inputs_embeds=input_embeds_batch, past_key_values=prefix_cache_batch, use_cache=True)
+                    # Generate additional tokens if needed
+                    if additional_tokens_needed > 0:
+                        # First get output with original sequence
+                        outputs = self.model(inputs_embeds=input_embeds_batch, past_key_values=prefix_cache_batch, use_cache=True)
+                        
+                        # Generate additional tokens
+                        extended_embeds = input_embeds_batch.clone()
+                        current_kv_cache = outputs.past_key_values
+                        
+                        for _ in range(additional_tokens_needed):
+                            # Get logits for the last position
+                            last_logits = outputs.logits[:, -1:, :]  # [batch_size, 1, vocab_size]
+                            
+                            # Sample next token (using argmax for deterministic behavior)
+                            next_token_id = torch.argmax(last_logits, dim=-1)  # [batch_size, 1]
+                            next_token_embed = self.embedding_layer(next_token_id)  # [batch_size, 1, embed_dim]
+                            
+                            # Append to sequence
+                            extended_embeds = torch.cat([extended_embeds, next_token_embed], dim=1)
+                            
+                            # Continue generation
+                            outputs = self.model(
+                                inputs_embeds=next_token_embed,
+                                past_key_values=current_kv_cache,
+                                use_cache=True,
+                            )
+                            current_kv_cache = outputs.past_key_values
+                        
+                        # Final forward pass with extended sequence
+                        outputs = self.model(inputs_embeds=extended_embeds, past_key_values=prefix_cache_batch, use_cache=True)
+                        final_embeds = extended_embeds
+                    else:
+                        outputs = self.model(inputs_embeds=input_embeds_batch, past_key_values=prefix_cache_batch, use_cache=True)
+                        final_embeds = input_embeds_batch
                 else:
-                    outputs = self.model(inputs_embeds=input_embeds_batch)
+                    # Generate additional tokens if needed (non-prefix case)
+                    if additional_tokens_needed > 0:
+                        extended_embeds = input_embeds_batch.clone()
+                        
+                        for _ in range(additional_tokens_needed):
+                            outputs = self.model(inputs_embeds=extended_embeds)
+                            last_logits = outputs.logits[:, -1:, :]
+                            next_token_id = torch.argmax(last_logits, dim=-1)
+                            next_token_embed = self.embedding_layer(next_token_id)
+                            extended_embeds = torch.cat([extended_embeds, next_token_embed], dim=1)
+                        
+                        outputs = self.model(inputs_embeds=extended_embeds)
+                        final_embeds = extended_embeds
+                    else:
+                        outputs = self.model(inputs_embeds=input_embeds_batch)
+                        final_embeds = input_embeds_batch
 
                 logits = outputs.logits
 
-                tmp = input_embeds.shape[1] - self.target_ids.shape[1]
-                shift_logits = logits[..., tmp-1:-1, :].contiguous()
+                # Token forcing loss calculation (unchanged - only over target tokens)
+                # We need to be careful here - the logits might be longer due to additional generation
+                # but we only want to compute loss over the original target tokens
+                original_input_length = input_embeds.shape[1]  # Length without additional tokens
+                tmp = original_input_length - self.target_ids.shape[1]
+                
+                # Extract logits corresponding to the original target region
+                shift_logits = logits[..., tmp-1:tmp-1+self.target_ids.shape[1], :].contiguous()
                 shift_labels = self.target_ids.repeat(current_batch_size, 1)
 
-                # Use the new loss function
-                batch_loss = self.compute_loss_with_refusal_direction(shift_logits, shift_labels, input_embeds_batch)
+                # Use the new loss function with extended embeddings for refusal calculation
+                batch_loss = self.compute_loss_with_refusal_direction(shift_logits, shift_labels, final_embeds)
                 all_loss.append(batch_loss)
 
                 if self.config.early_stop:
@@ -908,18 +1086,18 @@ class GCG:
                 self.add_wandb_metric("refusal_loss_min", refusal_loss.min().item())
                 self.add_wandb_metric("refusal_loss_max", refusal_loss.max().item())
             
-            # Combine losses: L = (1-β) * original_loss + β * refusal_loss
+            # Combine losses based on promote_caution setting
             if self.config.promote_caution:
                 # Maximize refusal alignment (promote caution)
                 combined_loss = (1 - current_beta) * original_loss - current_beta * refusal_loss
             else:
                 # Minimize refusal alignment (suppress refusal)
                 combined_loss = (1 - current_beta) * original_loss + current_beta * refusal_loss
-
-                
+            
             if self.using_wandb:
                 self.add_wandb_metric("combined_loss_mean", combined_loss.mean().item())
                 self.add_wandb_metric("combined_loss_min", combined_loss.min().item())
+                self.add_wandb_metric("promote_caution", self.config.promote_caution)
             
             return combined_loss
         
