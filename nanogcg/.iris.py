@@ -73,8 +73,6 @@ class GCGConfig:
     target_string: Optional[str] = None
     target_no_think: Optional[bool] = None
 
-    example_generation_frequency: int = 10  # How often to generate examples
-
     # refusal direction minimisation terms
     use_refusal_direction: bool = False
     refusal_vector_path: Optional[str] = None
@@ -83,8 +81,6 @@ class GCGConfig:
     refusal_num_tokens: int = 10  # Number of CoT tokens to use
     refusal_beta: float = 0.75  # weight balancing term
     
-    promote_caution: bool = False  # Whether to promote caution in the refusal direction, instead of minimise it
-
     # Option to average across all layers instead of using specific layer
     refusal_average_all_layers: bool = False
     
@@ -647,7 +643,7 @@ class GCG:
                 wandb.run.summary["best_loss"] = best_loss
 
                 # Generate and log model response periodically
-                if step % self.config.example_generation_frequency == 0:
+                if step % 25 == 0:
                     full_prompt = self.config.prompt_string + " " + best_string_value
                     messages = [{"role": "user", "content": full_prompt}]
                     input_tensor = tokenizer.apply_chat_template(
@@ -909,14 +905,8 @@ class GCG:
                 self.add_wandb_metric("refusal_loss_max", refusal_loss.max().item())
             
             # Combine losses: L = (1-β) * original_loss + β * refusal_loss
-            if self.config.promote_caution:
-                # Maximize refusal alignment (promote caution)
-                combined_loss = (1 - current_beta) * original_loss - current_beta * refusal_loss
-            else:
-                # Minimize refusal alignment (suppress refusal)
-                combined_loss = (1 - current_beta) * original_loss + current_beta * refusal_loss
-
-                
+            combined_loss = (1 - current_beta) * original_loss + current_beta * refusal_loss
+            
             if self.using_wandb:
                 self.add_wandb_metric("combined_loss_mean", combined_loss.mean().item())
                 self.add_wandb_metric("combined_loss_min", combined_loss.min().item())
