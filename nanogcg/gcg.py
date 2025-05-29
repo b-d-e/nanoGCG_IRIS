@@ -72,7 +72,8 @@ class GCGConfig:
     prompt_string: Optional[str] = None
     target_string: Optional[str] = None
     target_no_think: Optional[bool] = None
-
+    max_new_tokens: int = 2048  # Maximum new tokens to generate in the final response
+    
     # Adversarial positioning options
     use_prefix: bool = False  # If True, use adversarial prefix instead of suffix
     example_generation_frequency: int = 25  # How often to generate examples during optimization
@@ -715,7 +716,7 @@ class GCG:
                     output = model.generate( 
                         input_tensor, 
                         do_sample=False, 
-                        max_new_tokens=2048,
+                        max_new_tokens=self.config.max_new_tokens,
                     )
                     response = tokenizer.batch_decode(
                         output[:, input_tensor.shape[1]:], 
@@ -746,7 +747,7 @@ class GCG:
         output = model.generate(
             input_tensor, 
             do_sample=False, 
-            max_new_tokens=2048
+            max_new_tokens=self.config.max_new_tokens,
         )
         
         response = tokenizer.batch_decode(
@@ -1079,6 +1080,8 @@ class GCG:
         # Compute refusal loss term
         refusal_loss = self._compute_cot_refusal_loss(input_embeds)
         
+        refusal_loss = refusal_loss / 3
+
         if refusal_loss is not None:
             # Log refusal metrics
             if self.using_wandb:
@@ -1087,6 +1090,7 @@ class GCG:
                 self.add_wandb_metric("refusal_loss_max", refusal_loss.max().item())
             
             # Combine losses based on promote_caution setting
+            
             if self.config.promote_caution:
                 # Maximize refusal alignment (promote caution)
                 combined_loss = (1 - current_beta) * original_loss - current_beta * refusal_loss
