@@ -362,7 +362,7 @@ def run_single_experiment(args: Tuple) -> Dict:
             
             use_refusal_beta_schedule=False,
             promote_caution=False,
-            use_prefix=False,
+            use_prefix=False, # rather than suffix
         )
         
         messages = [{"role": "user", "content": forbidden_prompt}]

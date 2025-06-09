@@ -13,6 +13,7 @@ from typing import List, Optional, Tuple, Union, Dict, Any
 from typing import Callable
 import torch
 import transformers
+from transformers.cache_utils import DynamicCache
 from torch import Tensor
 from transformers import set_seed
 from scipy.stats import spearmanr
@@ -73,6 +74,11 @@ class GCGConfig:
     target_string: Optional[str] = None
     target_no_think: Optional[bool] = None
     max_new_tokens: int = 2048  # Maximum new tokens to generate in the final response
+    
+    # Generation parameters for sampling (defaults from your experiments)
+    do_sample: bool = True
+    temperature: float = 0.6
+    top_p: float = 0.95
     
     # Adversarial positioning options
     use_prefix: bool = False  # If True, use adversarial prefix instead of suffix
@@ -532,6 +538,36 @@ class GCG:
             # Clear metrics dictionary for next step
             self.wandb_metrics = {}
 
+
+    def generate_response(self, prompt: str) -> str:
+        """Generate a response using the configured sampling parameters."""
+        messages = [{"role": "user", "content": prompt}]
+        input_tensor = self.tokenizer.apply_chat_template(
+            messages, 
+            add_generation_prompt=True, 
+            return_tensors="pt"
+        ).to(self.model.device, torch.int64)
+        
+        attention_mask = torch.ones_like(input_tensor)
+        
+        output = self.model.generate(
+            input_tensor,
+            attention_mask=attention_mask,
+            do_sample=self.config.do_sample,
+            temperature=self.config.temperature,
+            top_p=self.config.top_p,
+            max_new_tokens=self.config.max_new_tokens,
+            pad_token_id=self.tokenizer.eos_token_id,
+        )
+        
+        response = self.tokenizer.batch_decode(
+            output[:, input_tensor.shape[1]:], 
+            skip_special_tokens=True
+        )[0]
+        
+        return response
+
+
     def run(
         self,
         messages: Union[str, List[dict]],
@@ -580,7 +616,11 @@ class GCG:
         if config.use_prefix_cache:
             with torch.no_grad():
                 output = model(inputs_embeds=before_embeds, use_cache=True)
-                self.prefix_cache = output.past_key_values
+                # Convert tuple cache to DynamicCache if needed
+                if isinstance(output.past_key_values, tuple):
+                    self.prefix_cache = DynamicCache.from_legacy_cache(output.past_key_values)
+                else:
+                    self.prefix_cache = output.past_key_values
 
         self.target_ids = target_ids
         self.before_embeds = before_embeds
@@ -612,7 +652,11 @@ class GCG:
             if config.use_prefix_cache:
                 with torch.no_grad():
                     output = self.draft_model(inputs_embeds=self.draft_before_embeds, use_cache=True)
-                    self.draft_prefix_cache = output.past_key_values
+                    # Convert tuple cache to DynamicCache if needed
+                    if isinstance(output.past_key_values, tuple):
+                        self.draft_prefix_cache = DynamicCache.from_legacy_cache(output.past_key_values)
+                    else:
+                        self.draft_prefix_cache = output.past_key_values
 
         # Initialize the attack buffer
         buffer = self.init_buffer()
@@ -707,21 +751,10 @@ class GCG:
                 # Generate and log model response periodically
                 if step % config.example_generation_frequency == 0:
                     full_prompt = self.config.prompt_string + " " + best_string_value
-                    messages = [{"role": "user", "content": full_prompt}]
-                    input_tensor = tokenizer.apply_chat_template(
-                        messages, 
-                        add_generation_prompt=True, 
-                        return_tensors="pt"
-                    ).to(model.device, torch.int64)
-                    output = model.generate( 
-                        input_tensor, 
-                        do_sample=False, 
-                        max_new_tokens=self.config.max_new_tokens,
-                    )
-                    response = tokenizer.batch_decode(
-                        output[:, input_tensor.shape[1]:], 
-                        skip_special_tokens=True
-                    )[0]
+
+                    response = self.generate_response(full_prompt)
+                    logger.debug(f"Generated response at step {step}: {response}")
+
                     wandb.run.summary["best_answer"] = response
 
             if self.stop_flag:
@@ -737,23 +770,8 @@ class GCG:
         full_prompt = self.config.prompt_string + " " + best_string_value
         print(full_prompt)
 
-        messages = [{"role": "user", "content": full_prompt}]
-        input_tensor = tokenizer.apply_chat_template(
-            messages, 
-            add_generation_prompt=True, 
-            return_tensors="pt"
-        ).to(model.device, torch.int64)
-        
-        output = model.generate(
-            input_tensor, 
-            do_sample=False, 
-            max_new_tokens=self.config.max_new_tokens,
-        )
-        
-        response = tokenizer.batch_decode(
-            output[:, input_tensor.shape[1]:], 
-            skip_special_tokens=True
-        )[0]
+        response = self.generate_response(full_prompt)
+        logger.debug(f"Final generated response: {response}")
         
         if self.using_wandb:
             wandb.run.summary["best_answer"] = response
@@ -767,7 +785,6 @@ class GCG:
         )
 
         wandb.finish()
-
         return result
 
     def init_buffer(self) -> AttackBuffer:
@@ -941,7 +958,7 @@ class GCG:
     def _compute_candidates_loss_original(self, search_batch_size: int, input_embeds: Tensor) -> Tensor:
         """Computes the GCG loss on all candidate token id sequences."""
         all_loss = []
-        prefix_cache_batch = []
+        prefix_cache_batch = None
 
         for i in range(0, input_embeds.shape[0], search_batch_size):
             with torch.no_grad():
@@ -956,8 +973,21 @@ class GCG:
                 additional_tokens_needed = max(0, self.config.refusal_num_tokens - target_length) if self.config.use_refusal_direction else 0
 
                 if self.prefix_cache:
+                    # Handle DynamicCache batch expansion
                     if not prefix_cache_batch or current_batch_size != search_batch_size:
-                        prefix_cache_batch = [[x.expand(current_batch_size, -1, -1, -1) for x in self.prefix_cache[i]] for i in range(len(self.prefix_cache))]
+                        if isinstance(self.prefix_cache, DynamicCache):
+                            # Create a new DynamicCache for the batch
+                            prefix_cache_batch = DynamicCache()
+                            for layer_idx in range(len(self.prefix_cache)):
+                                key_states = self.prefix_cache.key_cache[layer_idx]
+                                value_states = self.prefix_cache.value_cache[layer_idx]
+                                # Expand for batch size
+                                key_states_expanded = key_states.expand(current_batch_size, -1, -1, -1)
+                                value_states_expanded = value_states.expand(current_batch_size, -1, -1, -1)
+                                prefix_cache_batch.update(key_states_expanded, value_states_expanded, layer_idx)
+                        else:
+                            # Legacy tuple format handling (fallback)
+                            prefix_cache_batch = [[x.expand(current_batch_size, -1, -1, -1) for x in self.prefix_cache[i]] for i in range(len(self.prefix_cache))]
 
                     # Generate additional tokens if needed
                     if additional_tokens_needed > 0:
@@ -994,7 +1024,7 @@ class GCG:
                         outputs = self.model(inputs_embeds=input_embeds_batch, past_key_values=prefix_cache_batch, use_cache=True)
                         final_embeds = input_embeds_batch
                 else:
-                    # Generate additional tokens if needed (non-prefix case)
+                    # Non-prefix case remains largely the same
                     if additional_tokens_needed > 0:
                         extended_embeds = input_embeds_batch.clone()
                         
@@ -1014,8 +1044,6 @@ class GCG:
                 logits = outputs.logits
 
                 # Token forcing loss calculation (unchanged - only over target tokens)
-                # We need to be careful here - the logits might be longer due to additional generation
-                # but we only want to compute loss over the original target tokens
                 original_input_length = input_embeds.shape[1]  # Length without additional tokens
                 tmp = original_input_length - self.target_ids.shape[1]
                 
